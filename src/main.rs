@@ -41,6 +41,8 @@ fn main() {
         "process" => cli_process(&args[1..]),
         "diarize" => cli_diarize(&args[1..]),
         "stt" => cli_stt(&args[1..]),
+        "devices" => cli_devices(),
+        "selftest" => cli_selftest(),
         _ => Err(usage()),
     };
     if let Err(e) = result {
@@ -56,6 +58,8 @@ fn usage() -> String {
         "       meeting-recorder process <folder>      transcribe a recorded meeting",
         "       meeting-recorder diarize <audio> [--speakers N]",
         "       meeting-recorder stt <audio> [--language xx]",
+        "       meeting-recorder devices               list audio devices",
+        "       meeting-recorder selftest              record while playing a tone",
     ]
     .join("\n")
 }
@@ -201,3 +205,75 @@ fn cli_stt(args: &[String]) -> Result<(), String> {
     eprintln!("language: {:?}", result.language_code);
     Ok(())
 }
+
+fn cli_devices() -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let name = |d: &cpal::Device| {
+        d.description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_else(|e| format!("? ({e})"))
+    };
+    let default_in = host.default_input_device().map(|d| name(&d));
+    let default_out = host.default_output_device().map(|d| name(&d));
+    println!("default input:  {}", default_in.unwrap_or_default());
+    println!("default output: {}", default_out.unwrap_or_default());
+    for device in host.output_devices().map_err(|e| e.to_string())? {
+        let config = device.default_output_config().map(|c| format!("{c:?}"));
+        println!("output: {}  {}", name(&device), config.unwrap_or_else(|e| e.to_string()));
+    }
+    for device in host.input_devices().map_err(|e| e.to_string())? {
+        let config = device.default_input_config().map(|c| format!("{c:?}"));
+        println!("input:  {}  {}", name(&device), config.unwrap_or_else(|e| e.to_string()));
+    }
+    Ok(())
+}
+
+/// Records for four seconds while a quiet tone plays on the default output,
+/// then reports the peak of both tracks: the computer track must hear the tone.
+fn cli_selftest() -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let dir = std::env::temp_dir().join(format!("meeting-recorder-selftest-{}", capture::unix_ms()));
+    let recorder = capture::Recorder::start(&dir)?;
+    println!("Recording to {}", dir.display());
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or("no default output device")?;
+    let config = device.default_output_config().map_err(|e| e.to_string())?;
+    let rate = config.sample_rate() as f32;
+    let channels = usize::from(config.channels());
+    let mut phase = 0.0f32;
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let stream = device
+        .build_output_stream(
+            config.config(),
+            move |data: &mut [f32], _| {
+                for frame in data.chunks_mut(channels) {
+                    phase = (phase + 660.0 / rate) % 1.0;
+                    let v = (phase * std::f32::consts::TAU).sin() * 0.2;
+                    frame.iter_mut().for_each(|s| *s = v);
+                }
+            },
+            |e| eprintln!("playback error: {e}"),
+            None,
+        )
+        .map_err(|e| format!("could not play a tone (needs an f32 output): {e}"))?;
+    stream.play().map_err(|e| e.to_string())?;
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    drop(stream);
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let session = recorder.stop()?;
+    for side in [types::Side::Mic, types::Side::Computer] {
+        let samples = ffmpeg::decode_mono_16k(&dir.join(side.file_name()))?;
+        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        println!(
+            "{:<8} {:>5.1}s  peak {:>5.1} dBFS",
+            side.label(),
+            samples.len() as f32 / 16_000.0,
+            20.0 * peak.max(1e-6).log10()
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&session).unwrap_or_default());
+    Ok(())
+}
+

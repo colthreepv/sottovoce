@@ -1,17 +1,23 @@
 //! Records the default microphone and the default output's loopback into two
 //! mono Ogg/Opus files, encoded by FFmpeg as the audio comes in.
 //!
-//! WASAPI loopback delivers nothing while nothing plays, and a full queue
-//! drops packets. Every packet therefore carries the time it arrived, and the
-//! writer pads silence wherever a track fell behind the clock, so both tracks
-//! stay on the same timeline as the wall clock.
+//! Each track follows the Windows default device: when it changes (a headset
+//! connected, Bluetooth switching to its hands-free profile for a call) or the
+//! device fails, the track reopens on the new default and carries on in the
+//! same file, resampled to the rate the file started with.
+//!
+//! WASAPI loopback delivers nothing while nothing plays, a full queue drops
+//! packets and a device switch leaves a hole. Every packet therefore carries
+//! the time it arrived, and the writer pads silence wherever a track fell
+//! behind the clock, up to the moment recording stopped, so both tracks stay
+//! on the same timeline.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,16 +32,18 @@ const QUEUE_PACKETS: usize = 256;
 pub const BITRATE_BPS: u32 = 48_000;
 /// A track this far behind the clock gets silence.
 const GAP_TOLERANCE: Duration = Duration::from_millis(150);
+/// How often the default devices are checked.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackInfo {
     pub file: String,
-    pub device: String,
-    pub input_sample_rate: u32,
-    pub input_channels: u16,
+    /// The devices used, in order; more than one after a switch.
+    pub devices: Vec<String>,
+    pub sample_rate: u32,
     pub bitrate_bps: u32,
     pub duration_ms: i64,
-    /// Silence inserted for loopback pauses and dropped packets.
+    /// Silence inserted for loopback pauses, dropped packets and switches.
     pub padded_ms: i64,
     pub dropped_packets: u64,
     pub xruns: u64,
@@ -73,7 +81,8 @@ pub fn unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// A packet of mono samples and when it arrived, relative to the recording start.
+/// A packet of mono samples at the track rate and when it arrived, relative
+/// to the recording start.
 struct Packet {
     at: Duration,
     samples: Vec<i16>,
@@ -84,44 +93,64 @@ struct WriterResult {
     padded: u64,
 }
 
-struct Track {
+/// State of one track shared by its streams, its supervisor and the recorder.
+#[derive(Clone)]
+struct TrackState {
     side: Side,
-    device_name: String,
-    stream: Stream,
+    /// The file's sample rate: the first device's.
+    rate: u32,
+    started: Instant,
     sender: SyncSender<Packet>,
-    writer: JoinHandle<Result<WriterResult, String>>,
     peak: Arc<AtomicU32>,
     dropped_packets: Arc<AtomicU64>,
     xruns: Arc<AtomicU64>,
-    sample_rate: u32,
-    channels: u16,
+    /// Set by a stream error: the supervisor reopens the device.
+    reopen: Arc<AtomicBool>,
+    devices: Arc<Mutex<Vec<String>>>,
+    errors: Sender<String>,
+}
+
+struct Track {
+    state: TrackState,
+    quit: Sender<()>,
+    supervisor: JoinHandle<()>,
+    writer: JoinHandle<Result<WriterResult, String>>,
+    /// Microseconds since the start at which recording stopped; the writer
+    /// pads the track up to it.
+    stop_at_us: Arc<AtomicU64>,
 }
 
 impl Track {
-    fn finish(self) -> Result<TrackInfo, String> {
+    fn finish(self, stopped: Duration) -> Result<TrackInfo, String> {
         let Track {
-            side,
-            device_name,
-            stream,
-            sender,
+            state,
+            quit,
+            supervisor,
             writer,
+            stop_at_us,
+        } = self;
+        stop_at_us.store(stopped.as_micros() as u64, Ordering::SeqCst);
+        drop(quit);
+        let _ = supervisor.join();
+        let TrackState {
+            side,
+            rate,
+            sender,
             dropped_packets,
             xruns,
-            sample_rate,
-            channels,
+            devices,
             ..
-        } = self;
-        drop(stream);
+        } = state;
         drop(sender);
         let result = writer
             .join()
             .map_err(|_| format!("{}: encoder thread panicked", side.label()))??;
-        let ms = |samples: u64| (samples * 1000 / u64::from(sample_rate)) as i64;
+        let ms = |samples: u64| (samples * 1000 / u64::from(rate)) as i64;
+        let devices = devices.lock().map(|d| d.clone()).unwrap_or_default();
         Ok(TrackInfo {
             file: side.file_name().to_owned(),
-            device: device_name,
-            input_sample_rate: sample_rate,
-            input_channels: channels,
+            devices,
+            sample_rate: rate,
             bitrate_bps: BITRATE_BPS,
             duration_ms: ms(result.samples),
             padded_ms: ms(result.padded),
@@ -131,7 +160,7 @@ impl Track {
     }
 }
 
-/// A running recording. Drop it only through [Recorder::stop].
+/// A running recording. End it with [Recorder::stop].
 pub struct Recorder {
     dir: PathBuf,
     mic: Track,
@@ -144,7 +173,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Starts recording into `dir` (created when missing).
+    /// Starts recording into the folder (created when missing).
     pub fn start(dir: &Path) -> Result<Recorder, String> {
         if [Side::Mic, Side::Computer]
             .iter()
@@ -155,44 +184,31 @@ impl Recorder {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         crate::ffmpeg::check()?;
 
-        let host = cpal::default_host();
-        let microphone = host
-            .default_input_device()
-            .ok_or("no default microphone found")?;
-        let output = host
-            .default_output_device()
-            .ok_or("no default output device found")?;
-        let mic_config = microphone
-            .default_input_config()
-            .map_err(|e| format!("could not read the microphone format: {e}"))?;
-        // On WASAPI an input stream on a render endpoint is loopback capture.
-        let output_config = output
-            .default_output_config()
-            .map_err(|e| format!("could not read the output format: {e}"))?;
-
         let (error_sender, error_receiver) = mpsc::channel();
         let fatal = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        let mic = start_track(
-            Side::Mic,
-            &microphone,
-            mic_config,
-            dir,
-            started,
-            Arc::clone(&fatal),
-            error_sender.clone(),
-        )?;
-        let computer = start_track(
+        let mic = start_track(Side::Mic, dir, started, Arc::clone(&fatal), error_sender.clone())?;
+        let computer = match start_track(
             Side::Computer,
-            &output,
-            output_config,
             dir,
             started,
             Arc::clone(&fatal),
             error_sender,
-        )?;
+        ) {
+            Ok(track) => track,
+            Err(e) => {
+                let _ = mic.finish(started.elapsed());
+                return Err(e);
+            }
+        };
         let started_at_unix_ms = unix_ms();
-        let recorder = Recorder {
+        Session {
+            status: "recording".into(),
+            started_at_unix_ms,
+            ..Default::default()
+        }
+        .save(dir)?;
+        Ok(Recorder {
             dir: dir.to_path_buf(),
             mic,
             computer,
@@ -201,26 +217,7 @@ impl Recorder {
             fatal,
             error_receiver,
             errors: Vec::new(),
-        };
-        let playing = [&recorder.mic, &recorder.computer]
-            .into_iter()
-            .try_for_each(|track| {
-                track
-                    .stream
-                    .play()
-                    .map_err(|e| format!("could not start {}: {e}", track.side.label()))
-            });
-        if let Err(message) = playing {
-            let _ = recorder.stop();
-            return Err(message);
-        }
-        Session {
-            status: "recording".into(),
-            started_at_unix_ms,
-            ..Default::default()
-        }
-        .save(dir)?;
-        Ok(recorder)
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -235,29 +232,33 @@ impl Recorder {
         self.started.elapsed()
     }
 
-    pub fn mic_device(&self) -> &str {
-        &self.mic.device_name
+    /// The device the microphone track records from right now.
+    pub fn mic_device(&self) -> String {
+        current_device(&self.mic.state)
     }
 
-    pub fn computer_device(&self) -> &str {
-        &self.computer.device_name
+    /// The output whose loopback the computer track records right now.
+    pub fn computer_device(&self) -> String {
+        current_device(&self.computer.state)
     }
 
     /// Peak level of (mic, computer) since the previous call, 0.0..=1.0.
     pub fn levels(&self) -> (f32, f32) {
-        let take = |peak: &AtomicU32| f32::from_bits(peak.swap(0, Ordering::Relaxed)).clamp(0.0, 1.0);
-        (take(&self.mic.peak), take(&self.computer.peak))
+        let take =
+            |peak: &AtomicU32| f32::from_bits(peak.swap(0, Ordering::Relaxed)).clamp(0.0, 1.0);
+        (take(&self.mic.state.peak), take(&self.computer.state.peak))
     }
 
     /// Xrun counts of (mic, computer).
     pub fn xruns(&self) -> (u64, u64) {
         (
-            self.mic.xruns.load(Ordering::Relaxed),
-            self.computer.xruns.load(Ordering::Relaxed),
+            self.mic.state.xruns.load(Ordering::Relaxed),
+            self.computer.state.xruns.load(Ordering::Relaxed),
         )
     }
 
-    /// Errors so far; a fatal one means the recording should be stopped.
+    /// Messages so far (device switches and errors), and whether one was
+    /// fatal, which means the recording should be stopped.
     pub fn poll_errors(&mut self) -> (&[String], bool) {
         while let Ok(error) = self.error_receiver.try_recv() {
             self.errors.push(error);
@@ -265,18 +266,18 @@ impl Recorder {
         (&self.errors, self.fatal.load(Ordering::Relaxed))
     }
 
-    /// Stops both streams, finalizes the files and writes session.json.
+    /// Stops both tracks, finalizes the files and writes session.json.
     pub fn stop(mut self) -> Result<Session, String> {
         let stopped_at = unix_ms();
+        let stopped = self.started.elapsed();
         self.poll_errors();
-        let failed_before = self.fatal.load(Ordering::Relaxed);
         let mut errors = std::mem::take(&mut self.errors);
-        let mic = self.mic.finish().map_err(|e| errors.push(e.clone())).ok();
-        let computer = self.computer.finish().map_err(|e| errors.push(e.clone())).ok();
+        let mic = self.mic.finish(stopped).map_err(|e| errors.push(e)).ok();
+        let computer = self.computer.finish(stopped).map_err(|e| errors.push(e)).ok();
         while let Ok(error) = self.error_receiver.try_recv() {
             errors.push(error);
         }
-        let failed = failed_before || mic.is_none() || computer.is_none();
+        let failed = self.fatal.load(Ordering::Relaxed) || mic.is_none() || computer.is_none();
         let session = Session {
             status: if failed { "failed" } else { "completed" }.into(),
             started_at_unix_ms: self.started_at_unix_ms,
@@ -290,59 +291,183 @@ impl Recorder {
     }
 }
 
-fn start_track(
-    side: Side,
-    device: &Device,
-    config: SupportedStreamConfig,
-    dir: &Path,
-    started: Instant,
-    fatal: Arc<AtomicBool>,
-    error_sender: Sender<String>,
-) -> Result<Track, String> {
-    let sample_rate = config.sample_rate();
-    let channels = config.channels();
-    let device_name = device
+fn current_device(state: &TrackState) -> String {
+    state
+        .devices
+        .lock()
+        .ok()
+        .and_then(|d| d.last().cloned())
+        .unwrap_or_default()
+}
+
+/// The current Windows default device for a side, with its format and a key
+/// to notice a change. On WASAPI an input stream on a render endpoint is
+/// loopback capture.
+fn default_device(side: Side) -> Result<(Device, SupportedStreamConfig, String), String> {
+    let host = cpal::default_host();
+    let (device, config) = match side {
+        Side::Mic => {
+            let device = host.default_input_device().ok_or("no default microphone")?;
+            let config = device
+                .default_input_config()
+                .map_err(|e| format!("could not read the microphone format: {e}"))?;
+            (device, config)
+        }
+        Side::Computer => {
+            let device = host.default_output_device().ok_or("no default output device")?;
+            let config = device
+                .default_output_config()
+                .map_err(|e| format!("could not read the output format: {e}"))?;
+            (device, config)
+        }
+    };
+    let name = device
         .description()
         .map(|d| d.name().to_owned())
         .unwrap_or_else(|_| side.label().to_owned());
-    let (sender, receiver) = mpsc::sync_channel(QUEUE_PACKETS);
-    let writer = spawn_writer(dir.join(side.file_name()), sample_rate, receiver)?;
-    let peak = Arc::new(AtomicU32::new(0));
-    let dropped_packets = Arc::new(AtomicU64::new(0));
-    let xruns = Arc::new(AtomicU64::new(0));
-    let shared = Shared {
-        side,
-        channels: usize::from(channels),
-        started,
-        sender: sender.clone(),
-        peak: Arc::clone(&peak),
-        dropped_packets: Arc::clone(&dropped_packets),
-        xruns: Arc::clone(&xruns),
-        fatal,
-        error_sender,
-    };
-    let stream = build_stream_for_format(device, config, shared)?;
-    Ok(Track {
-        side,
-        device_name,
-        stream,
-        sender,
-        writer,
-        peak,
-        dropped_packets,
-        xruns,
-        sample_rate,
-        channels,
-    })
+    let key = format!("{:?}|{name}", device.id().ok());
+    Ok((device, config, key))
 }
 
-/// Pipes mono PCM into FFmpeg, padding silence where packets are missing.
+fn device_name(key: &str) -> &str {
+    key.split_once('|').map_or(key, |(_, name)| name)
+}
+
+fn start_track(
+    side: Side,
+    dir: &Path,
+    started: Instant,
+    fatal: Arc<AtomicBool>,
+    errors: Sender<String>,
+) -> Result<Track, String> {
+    let (device, config, key) = default_device(side)?;
+    let rate = config.sample_rate();
+    let (sender, receiver) = mpsc::sync_channel(QUEUE_PACKETS);
+    let stop_at_us = Arc::new(AtomicU64::new(u64::MAX));
+    let writer = spawn_writer(
+        dir.join(side.file_name()),
+        rate,
+        receiver,
+        Arc::clone(&stop_at_us),
+    )?;
+    let state = TrackState {
+        side,
+        rate,
+        started,
+        sender,
+        peak: Arc::new(AtomicU32::new(0)),
+        dropped_packets: Arc::new(AtomicU64::new(0)),
+        xruns: Arc::new(AtomicU64::new(0)),
+        reopen: Arc::new(AtomicBool::new(false)),
+        devices: Arc::new(Mutex::new(Vec::new())),
+        errors,
+    };
+    let (quit, quit_receiver) = mpsc::channel::<()>();
+    let (ready, ready_receiver) = mpsc::channel::<Result<(), String>>();
+    let supervised = state.clone();
+    let supervisor = thread::Builder::new()
+        .name(format!("capture-{}", side.label()))
+        .spawn(move || supervise(supervised, device, config, key, fatal, ready, quit_receiver))
+        .map_err(|e| format!("could not start the capture thread: {e}"))?;
+    let track = Track {
+        state,
+        quit,
+        supervisor,
+        writer,
+        stop_at_us,
+    };
+    match ready_receiver.recv() {
+        Ok(Ok(())) => Ok(track),
+        Ok(Err(e)) => {
+            let _ = track.finish(Duration::ZERO);
+            Err(e)
+        }
+        Err(_) => Err(format!("{}: the capture thread stopped", side.label())),
+    }
+}
+
+/// Owns the track's stream (a stream is dropped on the thread that made it)
+/// and reopens it on the current default device whenever that changes or the
+/// stream fails.
+fn supervise(
+    state: TrackState,
+    device: Device,
+    config: SupportedStreamConfig,
+    key: String,
+    fatal: Arc<AtomicBool>,
+    ready: Sender<Result<(), String>>,
+    quit: Receiver<()>,
+) {
+    let label = state.side.label();
+    let mut current = match open(&state, &device, config) {
+        Ok(stream) => {
+            push_device(&state, &key);
+            let _ = ready.send(Ok(()));
+            Some((key, stream))
+        }
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let mut failing_since: Option<Instant> = None;
+    loop {
+        match quit.recv_timeout(WATCH_INTERVAL) {
+            Err(RecvTimeoutError::Timeout) => {}
+            _ => break,
+        }
+        let reopen = state.reopen.swap(false, Ordering::Relaxed);
+        let wanted = default_device(state.side);
+        let changed = match (&wanted, &current) {
+            (Ok((_, _, key)), Some((current_key, _))) => key != current_key,
+            (Ok(_), None) => true,
+            (Err(_), _) => false,
+        };
+        if !reopen && !changed {
+            continue;
+        }
+        drop(current.take());
+        match wanted.and_then(|(device, config, key)| {
+            open(&state, &device, config).map(|stream| (key, stream))
+        }) {
+            Ok((key, stream)) => {
+                let _ = state
+                    .errors
+                    .send(format!("{label}: now recording {}", device_name(&key)));
+                push_device(&state, &key);
+                current = Some((key, stream));
+                failing_since = None;
+            }
+            Err(e) => {
+                // Keep trying; give up after a minute without any device.
+                let since = *failing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_secs(60) {
+                    let _ = state.errors.send(format!("{label}: {e}"));
+                    fatal.store(true, Ordering::Relaxed);
+                    break;
+                }
+                state.reopen.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    drop(current);
+}
+
+fn push_device(state: &TrackState, key: &str) {
+    if let Ok(mut devices) = state.devices.lock() {
+        devices.push(device_name(key).to_owned());
+    }
+}
+
+/// Pipes mono PCM into FFmpeg, padding silence where packets are missing and
+/// at the end up to the stop time.
 fn spawn_writer(
     path: PathBuf,
-    sample_rate: u32,
+    rate: u32,
     receiver: Receiver<Packet>,
+    stop_at_us: Arc<AtomicU64>,
 ) -> Result<JoinHandle<Result<WriterResult, String>>, String> {
-    let mut child = spawn_encoder(&path, sample_rate)?;
+    let mut child = spawn_encoder(&path, rate)?;
     let mut stdin = child
         .stdin
         .take()
@@ -350,16 +475,16 @@ fn spawn_writer(
     thread::Builder::new()
         .name(format!("encoder-{}", path.display()))
         .spawn(move || {
-            let rate = u64::from(sample_rate);
-            let tolerance = GAP_TOLERANCE.as_micros() as u64 * rate / 1_000_000;
+            let rate = u64::from(rate);
+            let at_sample = |us: u64| us * rate / 1_000_000;
+            let tolerance = at_sample(GAP_TOLERANCE.as_micros() as u64);
             let mut written = 0u64;
             let mut padded = 0u64;
             let mut failure = None;
             while let Ok(packet) = receiver.recv() {
                 let len = packet.samples.len() as u64;
                 // The packet ends at its arrival time, so it starts len earlier.
-                let expected_start =
-                    (packet.at.as_micros() as u64 * rate / 1_000_000).saturating_sub(len);
+                let expected_start = at_sample(packet.at.as_micros() as u64).saturating_sub(len);
                 if expected_start > written + tolerance {
                     let gap = expected_start - written;
                     if let Err(e) = write_silence(&mut stdin, gap) {
@@ -375,6 +500,20 @@ fn spawn_writer(
                 }
                 written += len;
             }
+            let stop_at = stop_at_us.load(Ordering::SeqCst);
+            if failure.is_none() && stop_at != u64::MAX {
+                let end = at_sample(stop_at);
+                if end > written + tolerance {
+                    let gap = end - written;
+                    match write_silence(&mut stdin, gap) {
+                        Ok(()) => {
+                            written += gap;
+                            padded += gap;
+                        }
+                        Err(e) => failure = Some(e),
+                    }
+                }
+            }
             finish_encoder(child, stdin, &path, failure)?;
             Ok(WriterResult {
                 samples: written,
@@ -384,9 +523,9 @@ fn spawn_writer(
         .map_err(|e| format!("could not start the encoder thread: {e}"))
 }
 
-fn spawn_encoder(path: &Path, sample_rate: u32) -> Result<Child, String> {
+fn spawn_encoder(path: &Path, rate: u32) -> Result<Child, String> {
     crate::ffmpeg::command()
-        .args(["-y", "-f", "s16le", "-ar", &sample_rate.to_string(), "-ac", "1"])
+        .args(["-y", "-f", "s16le", "-ar", &rate.to_string(), "-ac", "1"])
         .args(["-i", "pipe:0", "-map_metadata", "-1", "-c:a", "libopus"])
         .args(["-b:a", &BITRATE_BPS.to_string(), "-vbr", "on", "-application", "voip"])
         .args(["-f", "ogg"])
@@ -439,100 +578,118 @@ fn finish_encoder(
     Ok(())
 }
 
-/// What the audio callbacks share with the rest.
-struct Shared {
-    side: Side,
-    channels: usize,
-    started: Instant,
-    sender: SyncSender<Packet>,
-    peak: Arc<AtomicU32>,
-    dropped_packets: Arc<AtomicU64>,
-    xruns: Arc<AtomicU64>,
-    fatal: Arc<AtomicBool>,
-    error_sender: Sender<String>,
-}
-
 fn pcm16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16
 }
 
+/// Linear resampling of a mono stream from the device rate to the file rate;
+/// plenty for speech, and only used after a switch to a device with another
+/// rate.
+struct Resampler {
+    /// Input samples per output sample.
+    step: f64,
+    /// Position of the next output sample between prev (0) and the next input (1).
+    t: f64,
+    prev: f32,
+}
+
+impl Resampler {
+    fn new(from: u32, to: u32) -> Option<Resampler> {
+        (from != to).then(|| Resampler {
+            step: f64::from(from) / f64::from(to),
+            t: 1.0,
+            prev: 0.0,
+        })
+    }
+
+    fn push(&mut self, x: f32, out: &mut Vec<i16>) {
+        while self.t <= 1.0 {
+            out.push(pcm16(self.prev + (x - self.prev) * self.t as f32));
+            self.t += self.step;
+        }
+        self.t -= 1.0;
+        self.prev = x;
+    }
+}
+
 fn build_stream<T>(
+    state: &TrackState,
     device: &Device,
     config: SupportedStreamConfig,
-    shared: Shared,
 ) -> Result<Stream, String>
 where
     T: SizedSample + Copy,
     f32: FromSample<T>,
 {
-    let Shared {
-        side,
-        channels,
-        started,
-        sender,
-        peak,
-        dropped_packets,
-        xruns,
-        fatal,
-        error_sender,
-    } = shared;
-    let channels = channels.max(1);
-    let callback_fatal = Arc::clone(&fatal);
-    let callback_errors = error_sender.clone();
+    let channels = usize::from(config.channels()).max(1);
+    let mut resampler = Resampler::new(config.sample_rate(), state.rate);
+    let data_state = state.clone();
+    let error_state = state.clone();
     device
         .build_input_stream(
             config.config(),
             move |data: &[T], _| {
-                let at = started.elapsed();
-                let mut samples = Vec::with_capacity(data.len() / channels);
+                let s = &data_state;
+                let at = s.started.elapsed();
+                let mut samples = Vec::with_capacity(data.len() / channels + 8);
                 let mut level = 0.0f32;
                 for frame in data.chunks(channels) {
-                    let sum: f32 = frame.iter().map(|s| f32::from_sample(*s)).sum();
+                    let sum: f32 = frame.iter().map(|x| f32::from_sample(*x)).sum();
                     let mono = sum / channels as f32;
                     level = level.max(mono.abs());
-                    samples.push(pcm16(mono));
+                    match resampler.as_mut() {
+                        Some(r) => r.push(mono, &mut samples),
+                        None => samples.push(pcm16(mono)),
+                    }
                 }
-                peak.fetch_max(level.to_bits(), Ordering::Relaxed);
-                match sender.try_send(Packet { at, samples }) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        dropped_packets.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        if !callback_fatal.swap(true, Ordering::Relaxed) {
-                            let _ = callback_errors
-                                .send(format!("{}: the encoder stopped", side.label()));
-                        }
-                    }
+                s.peak.fetch_max(level.to_bits(), Ordering::Relaxed);
+                if let Err(TrySendError::Full(_)) = s.sender.try_send(Packet { at, samples }) {
+                    s.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 }
             },
             move |error| {
+                let s = &error_state;
                 if error.kind() == cpal::ErrorKind::Xrun {
-                    xruns.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    fatal.store(true, Ordering::Relaxed);
-                    let _ = error_sender.send(format!("{} capture error: {error}", side.label()));
+                    s.xruns.fetch_add(1, Ordering::Relaxed);
+                } else if !s.reopen.swap(true, Ordering::Relaxed) {
+                    let _ = s.errors.send(format!("{}: {error}", s.side.label()));
                 }
             },
             None,
         )
-        .map_err(|e| format!("could not open the {} stream: {e}", side.label()))
+        .map_err(|e| format!("could not open the {} stream: {e}", state.side.label()))
 }
 
-fn build_stream_for_format(
-    device: &Device,
-    config: SupportedStreamConfig,
-    shared: Shared,
-) -> Result<Stream, String> {
-    match config.sample_format() {
-        SampleFormat::F32 => build_stream::<f32>(device, config, shared),
-        SampleFormat::F64 => build_stream::<f64>(device, config, shared),
-        SampleFormat::I8 => build_stream::<i8>(device, config, shared),
-        SampleFormat::I16 => build_stream::<i16>(device, config, shared),
-        SampleFormat::I32 => build_stream::<i32>(device, config, shared),
-        SampleFormat::U8 => build_stream::<u8>(device, config, shared),
-        SampleFormat::U16 => build_stream::<u16>(device, config, shared),
-        SampleFormat::U32 => build_stream::<u32>(device, config, shared),
+fn open(state: &TrackState, device: &Device, config: SupportedStreamConfig) -> Result<Stream, String> {
+    let stream = match config.sample_format() {
+        SampleFormat::F32 => build_stream::<f32>(state, device, config),
+        SampleFormat::F64 => build_stream::<f64>(state, device, config),
+        SampleFormat::I8 => build_stream::<i8>(state, device, config),
+        SampleFormat::I16 => build_stream::<i16>(state, device, config),
+        SampleFormat::I32 => build_stream::<i32>(state, device, config),
+        SampleFormat::U8 => build_stream::<u8>(state, device, config),
+        SampleFormat::U16 => build_stream::<u16>(state, device, config),
+        SampleFormat::U32 => build_stream::<u32>(state, device, config),
         other => Err(format!("unsupported sample format: {other:?}")),
+    }?;
+    stream
+        .play()
+        .map_err(|e| format!("could not start the {} stream: {e}", state.side.label()))?;
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampling_keeps_the_duration() {
+        let mut r = Resampler::new(44_100, 48_000).unwrap();
+        let mut out = Vec::new();
+        for i in 0..44_100 {
+            r.push((i as f32 * 0.01).sin() * 0.5, &mut out);
+        }
+        assert!((out.len() as i64 - 48_000).abs() <= 2, "{}", out.len());
+        assert!(Resampler::new(48_000, 48_000).is_none());
     }
 }
