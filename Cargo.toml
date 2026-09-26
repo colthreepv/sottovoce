@@ -1,10 +1,29 @@
 [package]
-name = "omarchy-meeting-recorder-windows"
-version = "0.1.0"
+name = "meeting-recorder-windows"
+version = "0.2.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "meeting-recorder"
+path = "src/main.rs"
+
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cpal = "0.18.2"
 ctrlc = "3.4"
+dirs = "6"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+ort = "2.0.0-rc.13"
+realfft = "3"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "multipart", "json", "rustls"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+toml = "1"
+ureq = "3.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
