@@ -6,6 +6,7 @@
 
 mod capture;
 mod config;
+pub mod core;
 mod devices;
 mod diarize;
 mod elevenlabs;

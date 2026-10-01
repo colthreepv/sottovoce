@@ -17,7 +17,7 @@ impl From<Option<String>> for DeviceChoice {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AudioDevice {
     pub id: String,
     pub name: String,

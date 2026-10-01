@@ -10,7 +10,7 @@ use chrono::{Local, TimeZone};
 use crate::capture::Session;
 use crate::types::Meeting;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub dir: PathBuf,
     pub title: String,
@@ -124,7 +124,6 @@ pub fn rename(dir: &Path, title: &str) -> Result<PathBuf, String> {
     }
     let mut meeting = load(dir).unwrap_or_default();
     meeting.title = title.to_owned();
-    save(dir, &meeting)?;
     let stamp: String = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -147,12 +146,20 @@ pub fn rename(dir: &Path, title: &str) -> Result<PathBuf, String> {
     };
     let target = dir.with_file_name(name.trim_end_matches(['.', ' ']));
     if target == dir {
+        save(dir, &meeting)?;
         return Ok(target);
     }
     if target.exists() {
         return Err(format!("{} already exists", target.display()));
     }
+    if target.file_name().is_none() || target.file_name().is_some_and(|n| n == "." || n == "..") {
+        return Err("the name is not a valid folder name".into());
+    }
     std::fs::rename(dir, &target).map_err(|e| format!("could not rename the folder: {e}"))?;
+    if let Err(error) = save(&target, &meeting) {
+        let _ = std::fs::rename(&target, dir);
+        return Err(error);
+    }
     Ok(target)
 }
 

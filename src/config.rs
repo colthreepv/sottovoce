@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_STT_MODEL: &str = "scribe_v2";
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// ElevenLabs API key; ELEVENLABS_API_KEY is used when this is empty.
@@ -35,19 +35,63 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        Self::load_at(&Self::path()).unwrap_or_default()
+    }
+
+    pub fn load_at(path: &std::path::Path) -> Result<Self, String> {
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            use std::io::Write;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    file.write_all(DEFAULT_TEMPLATE.as_bytes())
+                        .map_err(|e| e.to_string())?;
+                    file.sync_all().map_err(|e| e.to_string())?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        toml::from_str(&text).map_err(|e| format!("Invalid config: {e}"))
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
+        self.save_at(&Self::path())
+    }
+
+    pub fn save_at(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let parent = path.parent().ok_or("config has no parent directory")?;
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let temporary = parent.join(format!(
+            ".config.{}.{}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.map_err(|e| e.to_string())
     }
 
     pub fn api_key(&self) -> Option<String> {
@@ -97,3 +141,20 @@ impl Config {
             .filter(|id| !id.trim().is_empty())
     }
 }
+
+const DEFAULT_TEMPLATE: &str = r#"# Sottovoce settings. Manual edits apply within one second.
+# Empty key uses ELEVENLABS_API_KEY.
+elevenlabs_api_key = ""
+stt_model = "scribe_v2"
+language = "auto"
+# Find multiple speakers with local Nemotron diarization.
+diarize = true
+# Paid transcription is opt-in.
+auto_transcribe = false
+# Empty device IDs follow the Windows default.
+mic_device = ""
+output_device = ""
+# Optional settings (uncomment to override):
+# your_name = "Valerio"
+# meetings_dir = 'C:\Users\Valerio\Documents\Meetings'
+"#;

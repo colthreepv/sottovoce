@@ -3,38 +3,22 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
-use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Vec2};
+use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Vec2};
 
-use crate::capture::Recorder;
 use crate::config::Config;
-use crate::devices::{self, AudioDevice, DeviceChoice};
+use crate::core::{Core, Event as CoreEvent, RecordingState};
+use crate::devices::AudioDevice;
 use crate::meetings::{self, Entry};
-use crate::pipeline;
 use crate::player::Player;
-use crate::types::{Abort, Event, Meeting, Side};
+use crate::types::{Meeting, Side};
 
 pub fn run() -> Result<(), String> {
-    // CPAL caches one process-wide enumerator. Its first creation must happen in
-    // a live MTA apartment, before winit (or a device chooser) can initialize it.
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (audio_quit, quit_rx) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        use cpal::traits::{DeviceTrait, HostTrait};
-        crate::audio_thread_init();
-        let _ = cpal::default_host()
-            .default_output_device()
-            .map(|d| d.default_output_config());
-        let _ = ready_tx.send(());
-        let _ = quit_rx.recv();
-    });
-    ready_rx.recv().map_err(|e| e.to_string())?;
-    let _audio_apartment = audio_quit;
+    // Initialize CPAL's cached enumerator in a live MTA before winit.
+    let (core, core_events) = Core::new()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Meeting Recorder")
@@ -45,7 +29,7 @@ pub fn run() -> Result<(), String> {
     eframe::run_native(
         "Meeting Recorder",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(App::new(cc, core, core_events)))),
     )
     .map_err(|e| format!("could not open Meeting Recorder: {e}"))
 }
@@ -57,15 +41,26 @@ enum Screen {
     Settings,
 }
 
+// Presentation-only snapshots. Audio handles never cross into the UI.
+struct RecordingView {
+    elapsed: Duration,
+}
+impl RecordingView {
+    fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+    fn mic_device(&self) -> &str {
+        "Selected microphone"
+    }
+    fn computer_device(&self) -> &str {
+        "Selected output"
+    }
+}
 struct Job {
     dir: PathBuf,
-    events: Receiver<Event>,
-    result: Receiver<Result<Meeting, String>>,
-    abort: Abort,
     stage: String,
     progress: f64,
     log: VecDeque<String>,
-    close_when_done: bool,
     finalizing: bool,
 }
 
@@ -73,22 +68,21 @@ struct App {
     config: Config,
     entries: Vec<Entry>,
     screen: Screen,
-    recorder: Option<Recorder>,
-    starting: Option<Receiver<Result<Recorder, String>>>,
-    recovery: Option<Receiver<()>>,
+    core: Core,
+    core_events: Receiver<CoreEvent>,
+    state: RecordingState,
+    shutting_down: bool,
+    recorder: Option<RecordingView>,
+    starting: Option<()>,
     allow_close: bool,
-    close_after_start: bool,
     folder_picker: Option<Receiver<Option<PathBuf>>>,
     test_seconds: Option<u64>,
     test_started: bool,
     settings_auto_transcribe: bool,
     input_devices: Vec<AudioDevice>,
     output_devices: Vec<AudioDevice>,
-    device_refresh: Option<Receiver<Result<(Vec<AudioDevice>, Vec<AudioDevice>), String>>>,
     device_popups_open: [bool; 2],
-    monitor_stop: Option<mpsc::Sender<()>>,
-    monitor_levels: Option<Receiver<Result<(f32, f32), String>>>,
-    monitor_worker: Option<JoinHandle<()>>,
+
     idle_meters: [f32; 2],
     recording_meters: [f32; 2],
     recording_elapsed: Duration,
@@ -99,7 +93,6 @@ struct App {
     meeting_cache: Option<(PathBuf, Meeting)>,
     saved_title: String,
     meeting_dirty: bool,
-    close_dialog: bool,
     notice: Option<String>,
     settings_key: String,
     settings_show_key: bool,
@@ -110,7 +103,7 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, core: Core, core_events: Receiver<CoreEvent>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(23, 26, 32);
         visuals.window_fill = Color32::from_rgb(28, 32, 39);
@@ -119,17 +112,13 @@ impl App {
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(43, 49, 59);
         visuals.selection.bg_fill = Color32::from_rgb(45, 105, 112);
         cc.egui_ctx.set_visuals(visuals);
-        let mut config = Config::load();
+        let config = core.get_config();
         if let Ok(dir) = std::env::var("MR_GUI_TEST_DIR") {
+            let mut config = config.clone();
             config.meetings_dir = Some(PathBuf::from(dir));
             config.auto_transcribe = Some(false);
+            let _ = core.update_config(config);
         }
-        let (recovered_tx, recovered_rx) = mpsc::channel();
-        let recovery_root = config.meetings_dir();
-        thread::spawn(move || {
-            meetings::recover(&recovery_root);
-            let _ = recovered_tx.send(());
-        });
         let mut app = Self {
             entries: meetings::list(&config.meetings_dir()),
             settings_key: config.elevenlabs_api_key.clone().unwrap_or_default(),
@@ -139,11 +128,13 @@ impl App {
             settings_diarize: config.diarize(),
             config: config.clone(),
             screen: Screen::Recording,
+            core,
+            core_events,
+            state: RecordingState::Ready,
+            shutting_down: false,
             recorder: None,
             starting: None,
-            recovery: Some(recovered_rx),
             allow_close: false,
-            close_after_start: false,
             folder_picker: None,
             test_seconds: std::env::var("MR_GUI_RECORD_TEST_SECONDS")
                 .ok()
@@ -152,11 +143,8 @@ impl App {
             settings_auto_transcribe: config.auto_transcribe(),
             input_devices: Vec::new(),
             output_devices: Vec::new(),
-            device_refresh: None,
             device_popups_open: [false; 2],
-            monitor_stop: None,
-            monitor_levels: None,
-            monitor_worker: None,
+
             idle_meters: [0.0; 2],
             recording_meters: [0.0; 2],
             recording_elapsed: Duration::ZERO,
@@ -167,7 +155,6 @@ impl App {
             meeting_cache: None,
             saved_title: String::new(),
             meeting_dirty: false,
-            close_dialog: false,
             notice: None,
             settings_message: None,
         };
@@ -177,309 +164,54 @@ impl App {
     }
 
     fn refresh_meetings(&mut self) {
-        self.entries = meetings::list(&self.config.meetings_dir());
+        self.entries = self
+            .core
+            .list_meetings()
+            .into_iter()
+            .map(|e| {
+                let mut entry = e.meeting;
+                if let Some(job) = e.job {
+                    entry.status = format!("{job:?}");
+                }
+                entry
+            })
+            .collect();
     }
-
     fn refresh_devices(&mut self) {
-        if self.device_refresh.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.device_refresh = Some(rx);
-        thread::spawn(move || {
-            crate::audio_thread_init();
-            let result = devices::inputs()
-                .and_then(|inputs| devices::outputs().map(|outputs| (inputs, outputs)));
-            let _ = tx.send(result);
-        });
-    }
-
-    fn stop_monitor(&mut self) {
-        if let Some(stop) = self.monitor_stop.take() {
-            let _ = stop.send(());
-        }
-        self.monitor_levels = None;
-        if let Some(worker) = self.monitor_worker.take() {
-            let _ = worker.join();
-        }
-        self.idle_meters = [0.0; 2];
-    }
-
-    fn start_monitor(&mut self) {
-        if self.monitor_stop.is_some() || self.device_refresh.is_some() {
-            return;
-        }
-        let mic = DeviceChoice::from(self.config.mic_device());
-        let output = DeviceChoice::from(self.config.output_device());
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let (levels_tx, levels_rx) = mpsc::channel();
-        let worker = thread::Builder::new()
-            .name("idle-audio-monitor".into())
-            .spawn(move || {
-                crate::audio_thread_init();
-                let monitor = match crate::capture::Monitor::start(mic, output) {
-                    Ok(monitor) => monitor,
-                    Err(error) => {
-                        let _ = levels_tx.send(Err(error));
-                        return;
-                    }
-                };
-                loop {
-                    match stop_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if levels_tx.send(Ok(monitor.levels())).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        match worker {
-            Ok(worker) => {
-                self.monitor_stop = Some(stop_tx);
-                self.monitor_levels = Some(levels_rx);
-                self.monitor_worker = Some(worker);
-            }
-            Err(error) => self.notice = Some(format!("Could not start audio monitor: {error}")),
+        if let Err(e) = self.core.list_devices() {
+            self.notice = Some(e);
         }
     }
-
-    fn poll_devices_and_monitor(&mut self) {
-        let devices = self
-            .device_refresh
-            .as_ref()
-            .and_then(|rx| match rx.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("device scan stopped unexpectedly".into()))
-                }
-                Err(TryRecvError::Empty) => None,
-            });
-        if let Some(result) = devices {
-            self.device_refresh = None;
-            match result {
-                Ok((inputs, outputs)) => {
-                    self.input_devices = inputs;
-                    self.output_devices = outputs;
-                }
-                Err(error) => self.notice = Some(format!("Could not list audio devices: {error}")),
-            }
-        }
-        let levels = self
-            .monitor_levels
-            .as_ref()
-            .and_then(|rx| match rx.try_recv() {
-                Ok(levels) => Some(levels),
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("audio monitor stopped unexpectedly".into()))
-                }
-                Err(TryRecvError::Empty) => None,
-            });
-        if let Some(levels) = levels {
-            match levels {
-                Ok((mic, output)) => {
-                    self.idle_meters[0] = smooth_level(self.idle_meters[0], mic);
-                    self.idle_meters[1] = smooth_level(self.idle_meters[1], output);
-                }
-                Err(error) => {
-                    self.notice = Some(format!("Could not monitor audio: {error}"));
-                    self.stop_monitor();
-                }
-            }
-        }
-    }
-
     fn select_meeting(&mut self, dir: PathBuf) {
         self.screen = Screen::Meeting(dir);
         self.notice = None;
     }
-
-    /// Opens the recording screen in a ready state. Capture only begins when
-    /// the user presses Record; meanwhile the idle monitor shows live levels.
     fn arm_recording(&mut self) {
-        if self.recorder.is_none() {
-            self.notice = None;
-            self.recording_errors.clear();
-        }
         self.screen = Screen::Recording;
     }
-
     fn start_recording(&mut self) {
-        if self.recorder.is_some() || self.job.is_some() || self.starting.is_some() {
-            return;
+        if let Err(e) = self.core.start_recording() {
+            self.notice = Some(e);
         }
-        self.stop_monitor();
-        let root = self.config.meetings_dir();
-        let mic_choice = crate::devices::DeviceChoice::from(self.config.mic_device());
-        let output_choice = crate::devices::DeviceChoice::from(self.config.output_device());
-        let dir = meetings::new_dir(&root, crate::capture::unix_ms());
-        self.notice = None;
         self.screen = Screen::Recording;
-        let (tx, rx) = mpsc::channel();
-        self.starting = Some(rx);
-        thread::spawn(move || {
-            crate::audio_thread_init();
-            crate::log_event(&format!("Starting recording: {}", dir.display()));
-            let result = Recorder::start(&dir, mic_choice, output_choice);
-            if result.is_ok() {
-                let _ = std::fs::write(dir.join(".recorder-pid"), std::process::id().to_string());
-            } else {
-                meetings::cleanup_failed_start(&dir);
-            }
-            if let Err(error) = &result {
-                crate::log_event(&format!("Recording start failed: {error}"));
-            }
-            // If the GUI disappeared while starting, still finalize the recording.
-            if let Err(mpsc::SendError(Ok(recorder))) = tx.send(result) {
-                let _ = recorder.stop();
-            }
-        });
     }
-
-    fn stop_recording(&mut self, close_when_done: bool) {
-        let Some(recorder) = self.recorder.take() else {
-            return;
+    fn stop_recording(&mut self, close: bool) {
+        let result = if close {
+            self.shutting_down = true;
+            self.core.shutdown()
+        } else {
+            self.core.stop_recording()
         };
-        self.recording_elapsed = recorder.elapsed();
-        let dir = recorder.dir().to_path_buf();
-        let config = self.config.clone();
-        let stop_only = close_when_done || !config.auto_transcribe();
-        self.start_job(dir.clone(), close_when_done, true, move |events, abort| {
-            let _ = events.send(Event::Stage("Finalizing recording".into()));
-            let session = recorder.stop()?;
-            let _ = std::fs::remove_file(dir.join(".recorder-pid"));
-            crate::log_event(&format!(
-                "Recording finalized: {} ({})",
-                dir.display(),
-                session.status
-            ));
-            let duration = session
-                .mic
-                .as_ref()
-                .map(|track| track.duration_ms)
-                .unwrap_or_default()
-                .max(
-                    session
-                        .computer
-                        .as_ref()
-                        .map(|track| track.duration_ms)
-                        .unwrap_or_default(),
-                );
-            let placeholder = Meeting {
-                title: meetings::default_title(session.started_at_unix_ms),
-                started_at_unix_ms: session.started_at_unix_ms,
-                duration_ms: duration,
-                ..Meeting::default()
-            };
-            meetings::save(&dir, &placeholder)?;
-            if session.status != "completed" {
-                return Err(if session.errors.is_empty() {
-                    "recording failed while finalizing".into()
-                } else {
-                    format!("recording failed: {}", session.errors.join("; "))
-                });
-            }
-            if stop_only {
-                return Ok(placeholder);
-            }
-            let options = pipeline::Options::from_config(&config)?;
-            pipeline::process(&dir, &options, &events, abort)
-        });
+        if let Err(e) = result {
+            self.notice = Some(e);
+        }
     }
-
     fn start_transcription(&mut self, dir: PathBuf) {
-        if self.job.is_some() || self.recorder.is_some() || self.starting.is_some() {
-            return;
+        if let Err(e) = self.core.transcribe(dir) {
+            self.notice = Some(e);
         }
-        if self.config.api_key().is_none() {
-            self.notice =
-                Some("Add your ElevenLabs API key in Settings to transcribe this meeting.".into());
-            return;
-        }
-        let config = self.config.clone();
-        self.notice = None;
-        self.start_job(dir.clone(), false, false, move |events, abort| {
-            let options = pipeline::Options::from_config(&config)?;
-            pipeline::process(&dir, &options, &events, abort)
-        });
     }
-
-    fn start_job<F>(&mut self, dir: PathBuf, close_when_done: bool, finalizing: bool, work: F)
-    where
-        F: FnOnce(crate::types::Events, &Abort) -> Result<Meeting, String> + Send + 'static,
-    {
-        let (event_tx, event_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let abort = Arc::new(AtomicBool::new(false));
-        let worker_abort = Arc::clone(&abort);
-        let _ = thread::Builder::new()
-            .name("meeting-recorder-job".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    work(event_tx, &worker_abort)
-                }))
-                .unwrap_or_else(|_| {
-                    Err("The background task panicked. See the application log.".into())
-                });
-                if let Err(error) = &result {
-                    crate::log_event(&format!("Job failed: {error}"));
-                }
-                let _ = done_tx.send(result);
-            });
-        self.job = Some(Job {
-            dir,
-            events: event_rx,
-            result: done_rx,
-            abort,
-            stage: "Starting…".into(),
-            progress: 0.0,
-            log: VecDeque::new(),
-            close_when_done,
-            finalizing,
-        });
-    }
-
     fn poll_background(&mut self, ctx: &egui::Context) {
-        self.poll_devices_and_monitor();
-        if self
-            .recovery
-            .as_ref()
-            .is_some_and(|rx| !matches!(rx.try_recv(), Err(TryRecvError::Empty)))
-        {
-            self.recovery = None;
-            self.refresh_meetings();
-        }
-        let startup = self.starting.as_ref().and_then(|rx| match rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Disconnected) => {
-                Some(Err("Recording startup stopped unexpectedly".into()))
-            }
-            Err(TryRecvError::Empty) => None,
-        });
-        if let Some(result) = startup {
-            self.starting = None;
-            match result {
-                Ok(recorder) => {
-                    self.recording_elapsed = Duration::ZERO;
-                    self.recording_errors.clear();
-                    self.recording_meters = [0.0; 2];
-                    self.recorder = Some(recorder);
-                    if self.close_after_start {
-                        self.close_after_start = false;
-                        self.stop_recording(true);
-                    }
-                }
-                Err(error) => {
-                    self.recording_errors = vec![format!("Could not start recording: {error}")];
-                    self.notice = Some(error);
-                    if self.close_after_start {
-                        self.allow_close = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-            }
-        }
         if let Some(rx) = &self.folder_picker {
             match rx.try_recv() {
                 Ok(path) => {
@@ -489,78 +221,78 @@ impl App {
                     self.folder_picker = None;
                 }
                 Err(TryRecvError::Disconnected) => self.folder_picker = None,
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => (),
             }
         }
-        let mut fatal = false;
-        if let Some(recorder) = &mut self.recorder {
-            self.recording_elapsed = recorder.elapsed();
-            let (mic, computer) = recorder.levels();
-            self.recording_meters[0] = smooth_level(self.recording_meters[0], mic);
-            self.recording_meters[1] = smooth_level(self.recording_meters[1], computer);
-            let (errors, is_fatal) = recorder.poll_errors();
-            for error in errors {
-                if !self.recording_errors.contains(error) {
-                    self.recording_errors.push(error.clone());
+        while let Ok(event) = self.core_events.try_recv() {
+            match event {
+                CoreEvent::Levels { mic, system } => {
+                    self.idle_meters = [
+                        smooth_level(self.idle_meters[0], mic),
+                        smooth_level(self.idle_meters[1], system),
+                    ];
+                    self.recording_meters = self.idle_meters;
                 }
-            }
-            fatal = is_fatal;
-        }
-        if fatal {
-            self.stop_recording(false);
-        }
-
-        let mut completed = None;
-        if let Some(job) = &mut self.job {
-            while let Ok(event) = job.events.try_recv() {
-                match event {
-                    Event::Stage(stage) => {
-                        crate::log_event(&stage);
-                        job.finalizing = stage == "Finalizing recording";
-                        job.stage = stage;
-                        job.progress = 0.0;
+                CoreEvent::RecordingStateChanged {
+                    state, elapsed_ms, ..
+                } => {
+                    self.state = state;
+                    self.starting = (state == RecordingState::Starting).then_some(());
+                    self.recording_elapsed = Duration::from_millis(elapsed_ms);
+                    self.recorder = (state == RecordingState::Recording).then_some(RecordingView {
+                        elapsed: self.recording_elapsed,
+                    });
+                }
+                CoreEvent::DevicesChanged { devices } => {
+                    self.input_devices = devices.inputs;
+                    self.output_devices = devices.outputs;
+                }
+                CoreEvent::ConfigChanged { config } => {
+                    self.config = config;
+                    if matches!(self.screen, Screen::Settings) {
+                        self.load_settings_draft();
                     }
-                    Event::Progress(progress) => job.progress = progress.clamp(0.0, 1.0),
-                    Event::Log(line) => {
-                        crate::log_event(&line);
-                        job.log.push_back(line);
-                        while job.log.len() > 60 {
-                            job.log.pop_front();
-                        }
+                    self.refresh_meetings();
+                }
+                CoreEvent::MeetingsChanged | CoreEvent::JobQueued { .. } => self.refresh_meetings(),
+                CoreEvent::JobProgress {
+                    meeting,
+                    stage,
+                    progress,
+                } => {
+                    self.job = Some(Job {
+                        dir: meeting,
+                        stage,
+                        progress,
+                        log: VecDeque::new(),
+                        finalizing: false,
+                    });
+                }
+                CoreEvent::JobDone { meeting } => {
+                    if self.job.as_ref().is_some_and(|j| j.dir == meeting) {
+                        self.job = None;
                     }
+                    self.meeting_cache = None;
+                    self.refresh_meetings();
                 }
-            }
-            match job.result.try_recv() {
-                Ok(result) => completed = Some(result),
-                Err(TryRecvError::Disconnected) => {
-                    completed = Some(Err("the background task stopped unexpectedly".into()));
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(result) = completed {
-            let Some(job) = self.job.take() else { return };
-            self.refresh_meetings();
-            self.meeting_cache = None;
-            self.select_meeting(job.dir.clone());
-            match result {
-                Ok(_) => {
-                    self.notice = None;
-                }
-                Err(error) => {
-                    if error.starts_with("no ElevenLabs API key") {
-                        self.notice = Some("Recording is saved. Add your ElevenLabs API key in Settings to transcribe it.".into());
-                    } else if error == crate::types::CANCELLED {
-                        self.notice =
-                            Some("Transcription cancelled. The recording is still saved.".into());
-                    } else {
-                        self.notice = Some(error);
+                CoreEvent::JobFailed { meeting, error } => {
+                    if self.job.as_ref().is_some_and(|j| j.dir == meeting) {
+                        self.job = None;
                     }
+                    self.notice = Some(error);
+                    self.refresh_meetings();
                 }
-            }
-            if job.close_when_done {
-                self.allow_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                CoreEvent::JobCancelled { meeting } => {
+                    if self.job.as_ref().is_some_and(|j| j.dir == meeting) {
+                        self.job = None;
+                    }
+                    self.refresh_meetings();
+                }
+                CoreEvent::Error { message } => self.notice = Some(message),
+                CoreEvent::ShutdownComplete => {
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
     }
@@ -586,7 +318,7 @@ impl App {
                     }
                 });
                 ui.add_space(14.0);
-                let can_open = self.job.is_none() && self.starting.is_none();
+                let can_open = !self.shutting_down;
                 let label = if self.recorder.is_some() {
                     "Show recording"
                 } else {
@@ -630,10 +362,8 @@ impl App {
                                 entry.title,
                                 date,
                                 format_duration(entry.duration_ms),
-                                if matches!(
-                                    entry.status.as_str(),
-                                    "empty" | "interrupted" | "failed"
-                                ) {
+                                if !matches!(entry.status.as_str(), "completed" | "recording" | "")
+                                {
                                     entry.status.as_str()
                                 } else {
                                     ""
@@ -714,7 +444,7 @@ impl App {
             ("●  RECORDING", Color32::from_rgb(235, 105, 95))
         } else if self.starting.is_some() {
             ("◌  Starting…", Color32::from_rgb(230, 190, 110))
-        } else if self.job.is_some() {
+        } else if self.state == RecordingState::Finalizing {
             ("◌  Saving…", Color32::from_rgb(130, 194, 187))
         } else {
             (
@@ -741,7 +471,10 @@ impl App {
         ui.add_space(14.0);
         let active = self.recorder.is_some();
         ui.vertical_centered(|ui| {
-            let finalizing = self.job.is_some() || self.starting.is_some();
+            let finalizing = matches!(
+                self.state,
+                RecordingState::Starting | RecordingState::Finalizing
+            ) || self.shutting_down;
             let label = if active {
                 "Stop recording"
             } else if self.starting.is_some() {
@@ -825,7 +558,7 @@ impl App {
             .find(|device| device.is_default)
             .map(|device| device.name.clone())
             .unwrap_or_else(|| {
-                if self.device_refresh.is_some() {
+                if self.input_devices.is_empty() && self.output_devices.is_empty() {
                     "scanning…".into()
                 } else {
                     "unavailable".into()
@@ -854,7 +587,7 @@ impl App {
         };
         let was_open = self.device_popups_open[index];
         let mut new_choice: Option<Option<String>> = None;
-        let enabled = self.recorder.is_none() && self.starting.is_none() && self.job.is_none();
+        let enabled = self.state == RecordingState::Ready;
         let response = ui
             .horizontal(|ui| {
                 ui.add_sized([110.0, 20.0], egui::Label::new(title));
@@ -903,7 +636,10 @@ impl App {
         } else {
             self.idle_meters[index]
         };
-        let listening = self.recorder.is_some() || self.monitor_stop.is_some();
+        let listening = matches!(
+            self.state,
+            RecordingState::Ready | RecordingState::Recording
+        );
         ui.horizontal(|ui| {
             ui.add_space(118.0);
             meter(ui, level, listening, index == 1);
@@ -920,8 +656,8 @@ impl App {
             } else {
                 self.config.output_device = choice;
             }
-            match self.config.save() {
-                Ok(()) => self.stop_monitor(),
+            match self.core.update_config(self.config.clone()) {
+                Ok(()) => (),
                 Err(error) => {
                     if index == 0 {
                         self.config.mic_device = old;
@@ -1100,7 +836,7 @@ impl App {
                         ui.add_space(12.0);
                         if ui
                             .add_enabled(
-                                self.job.is_none(),
+                                true,
                                 egui::Button::new(RichText::new("Transcribe").size(20.0).strong())
                                     .min_size(Vec2::new(210.0, 48.0)),
                             )
@@ -1175,17 +911,26 @@ impl App {
             self.meeting_dirty = true;
         }
         if self.meeting_dirty
-            && self.job.is_none()
+            && !self.core.jobs().get(&dir).is_some_and(|j| {
+                matches!(
+                    j,
+                    crate::core::JobState::Queued
+                        | crate::core::JobState::Running
+                        | crate::core::JobState::Cancelling
+                )
+            })
             && self.recorder.is_none()
             && (title_commit || editor_lost_focus || editor_enter)
         {
             match meetings::save(&dir, &meeting) {
                 Ok(()) => {
                     let new_dir = if meeting.title.trim() != self.saved_title.trim() {
-                        meetings::rename(&dir, &meeting.title).unwrap_or_else(|error| {
-                            self.notice = Some(error);
-                            dir.clone()
-                        })
+                        self.core
+                            .rename_meeting(dir.clone(), meeting.title.clone())
+                            .unwrap_or_else(|error| {
+                                self.notice = Some(error);
+                                dir.clone()
+                            })
                     } else {
                         dir.clone()
                     };
@@ -1326,7 +1071,7 @@ impl App {
             Some(PathBuf::from(folder))
         };
         self.config.diarize = Some(self.settings_diarize);
-        match self.config.save() {
+        match self.core.update_config(self.config.clone()) {
             Ok(()) => {
                 self.settings_message = Some("Saved. Changes are ready to use.".into());
                 self.refresh_meetings();
@@ -1336,6 +1081,19 @@ impl App {
     }
 
     fn show_job(&mut self, ui: &mut egui::Ui) {
+        for (dir, state) in self.core.jobs() {
+            if state == crate::core::JobState::Queued {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Queued: {}",
+                        dir.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    if ui.small_button("Cancel queued job").clicked() {
+                        let _ = self.core.cancel_job(dir.clone());
+                    }
+                });
+            }
+        }
         let Some(job) = &mut self.job else { return };
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -1344,7 +1102,7 @@ impl App {
                     .add_enabled(!job.finalizing, egui::Button::new("Cancel").small())
                     .clicked()
                 {
-                    job.abort.store(true, Ordering::Relaxed);
+                    let _ = self.core.cancel_job(job.dir.clone());
                     job.stage = "Cancelling…".into();
                 }
             });
@@ -1381,70 +1139,17 @@ impl App {
     }
 
     fn show_close_dialog(&mut self, ctx: &egui::Context) {
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
         if self.allow_close {
             return;
         }
-        if close_requested {
+        if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.close_after_start || self.job.as_ref().is_some_and(|j| j.close_when_done) {
-                return;
-            } else if self.recorder.is_some() || self.job.is_some() || self.starting.is_some() {
-                self.close_dialog = true;
-            } else {
-                self.allow_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-        if !self.close_dialog {
-            return;
-        }
-        let mut answer = None;
-        egui::Window::new("Finish before closing?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let text = if self.recorder.is_some() {
-                    "The recording will be stopped and its audio files finalized."
-                } else {
-                    "The current transcription will be cancelled before the app closes."
-                };
-                ui.label(text);
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Continue and close").clicked() {
-                        answer = Some(true);
-                    }
-                    if ui.button("Keep working").clicked() {
-                        answer = Some(false);
-                    }
-                });
-            });
-        match answer {
-            Some(true) => {
-                self.close_dialog = false;
-                if self.recorder.is_some() {
-                    self.stop_recording(true);
-                } else if self.starting.is_some() {
-                    self.close_after_start = true;
-                } else if let Some(job) = &mut self.job {
-                    job.abort.store(true, Ordering::Relaxed);
-                    if job.finalizing {
-                        job.close_when_done = true;
-                    } else {
-                        // HTTP cancellation is cooperative and may await a two-hour request.
-                        // Audio is already saved; detached transcription must not hold the window.
-                        self.allow_close = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                } else {
-                    self.allow_close = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if !self.shutting_down {
+                self.shutting_down = true;
+                if let Err(e) = self.core.shutdown() {
+                    self.notice = Some(e);
                 }
             }
-            Some(false) => self.close_dialog = false,
-            None => {}
         }
     }
 }
@@ -1454,17 +1159,6 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.show_close_dialog(&ctx);
         self.poll_background(&ctx);
-        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
-        let should_monitor = matches!(self.screen, Screen::Recording)
-            && self.recorder.is_none()
-            && self.starting.is_none()
-            && self.job.is_none()
-            && !minimized;
-        if should_monitor {
-            self.start_monitor();
-        } else {
-            self.stop_monitor();
-        }
         if let Some(seconds) = self.test_seconds {
             if !self.test_started {
                 self.test_started = true;
@@ -1486,11 +1180,9 @@ impl eframe::App for App {
             Screen::Meeting(dir) => self.show_meeting(ui, &ctx, dir),
             Screen::Settings => self.show_settings(ui),
         });
+        ctx.request_repaint_after(Duration::from_millis(80));
         if self.folder_picker.is_some()
-            || self.device_refresh.is_some()
-            || self.monitor_stop.is_some()
             || self.starting.is_some()
-            || self.recovery.is_some()
             || self.test_seconds.is_some()
             || self.recorder.is_some()
             || self.job.is_some()
@@ -1539,7 +1231,10 @@ fn meter(ui: &mut egui::Ui, value: f32, listening: bool, system_audio: bool) {
         for db in [-48.0_f32, -36.0, -24.0, -12.0] {
             let x = rect.left() + rect.width() * (db + 60.0) / 60.0;
             ui.painter().line_segment(
-                [egui::pos2(x, rect.bottom() - 4.0), egui::pos2(x, rect.bottom())],
+                [
+                    egui::pos2(x, rect.bottom() - 4.0),
+                    egui::pos2(x, rect.bottom()),
+                ],
                 egui::Stroke::new(1.0, Color32::from_gray(90)),
             );
         }

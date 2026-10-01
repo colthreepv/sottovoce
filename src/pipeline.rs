@@ -24,7 +24,7 @@ impl Options {
             stt: SttOptions {
                 api_key,
                 model_id: config.stt_model(),
-                language: None,
+                language: config.language(),
             },
             diarize: config.diarize(),
             your_name: config.your_name.clone().filter(|n| !n.trim().is_empty()),

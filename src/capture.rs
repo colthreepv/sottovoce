@@ -180,12 +180,13 @@ pub struct Monitor {
     mic_receiver: Receiver<Packet>,
     computer_receiver: Receiver<Packet>,
     workers: Vec<(Sender<()>, JoinHandle<()>)>,
+    error_receiver: Receiver<String>,
 }
 
 impl Monitor {
     pub fn start(mic_choice: DeviceChoice, output_choice: DeviceChoice) -> Result<Self, String> {
         let started = Instant::now();
-        let (errors, _) = mpsc::channel();
+        let (errors, error_receiver) = mpsc::channel();
         let (mic, mic_receiver, mic_worker) =
             start_monitor_track(Side::Mic, started, errors.clone(), mic_choice)?;
         let (computer, computer_receiver, computer_worker) =
@@ -202,8 +203,11 @@ impl Monitor {
             mic_receiver,
             computer_receiver,
             workers: vec![mic_worker, computer_worker],
+            error_receiver,
         })
     }
+
+    pub fn poll_errors(&self) -> Vec<String> { self.error_receiver.try_iter().collect() }
 
     pub fn levels(&self) -> (f32, f32) {
         while self.mic_receiver.try_recv().is_ok() {}
