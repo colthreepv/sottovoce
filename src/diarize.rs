@@ -10,8 +10,6 @@ use std::sync::atomic::Ordering;
 
 use crate::types::{Abort, CANCELLED, Event, Events, Turn};
 
-const RATE: usize = 16_000;
-
 /// Finds the speakers in `samples` (16 kHz mono). `speakers` fixes how many
 /// there are; `None` lets the model decide.
 pub fn turns(
@@ -147,54 +145,6 @@ fn renumber(mut raw: Vec<(i64, i64, i32)>) -> Vec<Turn> {
         .collect()
 }
 
-/// The whole file as one speaker, for when there is only one.
-pub fn single(samples: &[f32]) -> Vec<Turn> {
-    vec![Turn {
-        start_ms: 0,
-        end_ms: (samples.len() * 1000 / RATE) as i64,
-        speaker: 0,
-    }]
-}
-
-/// The speaker of `start_ms..end_ms`: the one whose turns overlap it most, or
-/// the nearest turn when none do (whisper's words can fall in a gap).
-pub fn speaker_at(turns: &[Turn], start_ms: i64, end_ms: i64) -> usize {
-    let end_ms = end_ms.max(start_ms + 1);
-    let mut overlap = std::collections::HashMap::<usize, i64>::new();
-    for turn in turns {
-        let shared = turn.end_ms.min(end_ms) - turn.start_ms.max(start_ms);
-        if shared > 0 {
-            *overlap.entry(turn.speaker).or_default() += shared;
-        }
-    }
-    if let Some((speaker, _)) = overlap
-        .into_iter()
-        .max_by_key(|(s, o)| (*o, usize::MAX - s))
-    {
-        return speaker;
-    }
-    let middle = (start_ms + end_ms) / 2;
-    turns
-        .iter()
-        .min_by_key(|t| {
-            if middle < t.start_ms {
-                t.start_ms - middle
-            } else {
-                (middle - t.end_ms).max(0)
-            }
-        })
-        .map_or(0, |t| t.speaker)
-}
-
-/// Where `speaker`'s turn starts near `around_ms`, within a second and a half.
-pub fn turn_start_near(turns: &[Turn], speaker: usize, around_ms: i64) -> Option<i64> {
-    turns
-        .iter()
-        .filter(|t| t.speaker == speaker && (t.start_ms - around_ms).abs() <= 1500)
-        .min_by_key(|t| (t.start_ms - around_ms).abs())
-        .map(|t| t.start_ms)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,27 +159,5 @@ mod tests {
         ]);
         let order: Vec<usize> = turns.iter().map(|t| t.speaker).collect();
         assert_eq!(order, vec![0, 1, 1, 0]);
-    }
-
-    #[test]
-    fn words_go_to_the_turn_they_overlap_most() {
-        let turns = vec![
-            Turn {
-                start_ms: 0,
-                end_ms: 2000,
-                speaker: 0,
-            },
-            Turn {
-                start_ms: 1800,
-                end_ms: 5000,
-                speaker: 1,
-            },
-        ];
-        assert_eq!(speaker_at(&turns, 1500, 1900), 0);
-        assert_eq!(speaker_at(&turns, 1900, 3000), 1);
-        // In a gap after the last turn: the nearest one.
-        assert_eq!(speaker_at(&turns, 6000, 6500), 1);
-        assert_eq!(turn_start_near(&turns, 1, 2500), Some(1800));
-        assert_eq!(turn_start_near(&turns, 1, 9000), None);
     }
 }

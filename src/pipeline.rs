@@ -113,11 +113,7 @@ pub fn process(
     let _ = events.send(Event::Stage("Building the conversation".into()));
     let (mut speakers, utterances) = crate::transcript::build(&sides, options.your_name.as_deref());
     if let Some(previous) = &previous {
-        for speaker in &mut speakers {
-            if let Some(old) = previous.speakers.iter().find(|s| s.id == speaker.id) {
-                speaker.name = old.name.clone();
-            }
-        }
+        preserve_speaker_names(&mut speakers, &utterances, previous);
     }
     let started = previous
         .as_ref()
@@ -141,4 +137,83 @@ pub fn process(
     crate::meetings::save(dir, &meeting)?;
     let _ = events.send(Event::Stage("Done".into()));
     Ok(meeting)
+}
+
+/// Echo removal can renumber IDs. Match names by surviving speech timing,
+/// and never carry an automatically numbered label back onto a single voice.
+fn preserve_speaker_names(
+    speakers: &mut [crate::types::Speaker],
+    utterances: &[crate::types::Utterance],
+    previous: &Meeting,
+) {
+    for speaker in speakers {
+        let mut overlap = std::collections::HashMap::<&str, i64>::new();
+        for current in utterances.iter().filter(|u| u.speaker == speaker.id) {
+            for old in previous
+                .utterances
+                .iter()
+                .filter(|u| u.side == speaker.side)
+            {
+                let shared = current.end_ms.min(old.end_ms) - current.start_ms.max(old.start_ms);
+                if shared > 0 {
+                    *overlap.entry(&old.speaker).or_default() += shared;
+                }
+            }
+        }
+        let old_id = overlap
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(id, _)| id)
+            .unwrap_or(&speaker.id);
+        if let Some(old) = previous
+            .speakers
+            .iter()
+            .find(|s| s.id == old_id && s.side == speaker.side)
+        {
+            let label = old.side.label();
+            let generated = old.name == label
+                || old
+                    .name
+                    .strip_prefix(&format!("{label} "))
+                    .is_some_and(|suffix| suffix.parse::<usize>().is_ok());
+            if !generated {
+                speaker.name = old.name.clone();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Side, Speaker, Utterance};
+    #[test]
+    fn preserves_custom_names_after_renumbering_but_refreshes_default_labels() {
+        let utterance = |speaker: &str| Utterance {
+            speaker: speaker.into(),
+            side: Side::Mic,
+            start_ms: 1000,
+            end_ms: 2000,
+            text: "Local speech".into(),
+        };
+        let mut speakers = vec![Speaker {
+            id: "you-1".into(),
+            side: Side::Mic,
+            name: "You".into(),
+        }];
+        let mut previous = Meeting {
+            speakers: vec![Speaker {
+                id: "you-4".into(),
+                side: Side::Mic,
+                name: "You 4".into(),
+            }],
+            utterances: vec![utterance("you-4")],
+            ..Default::default()
+        };
+        preserve_speaker_names(&mut speakers, &[utterance("you-1")], &previous);
+        assert_eq!(speakers[0].name, "You");
+        previous.speakers[0].name = "Valerio".into();
+        preserve_speaker_names(&mut speakers, &[utterance("you-1")], &previous);
+        assert_eq!(speakers[0].name, "Valerio");
+    }
 }

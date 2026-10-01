@@ -6,13 +6,14 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Vec2};
 
 use crate::capture::Recorder;
 use crate::config::Config;
+use crate::devices::{self, AudioDevice, DeviceChoice};
 use crate::meetings::{self, Entry};
 use crate::pipeline;
 use crate::player::Player;
@@ -81,6 +82,14 @@ struct App {
     test_seconds: Option<u64>,
     test_started: bool,
     settings_auto_transcribe: bool,
+    input_devices: Vec<AudioDevice>,
+    output_devices: Vec<AudioDevice>,
+    device_refresh: Option<Receiver<Result<(Vec<AudioDevice>, Vec<AudioDevice>), String>>>,
+    device_popups_open: [bool; 2],
+    monitor_stop: Option<mpsc::Sender<()>>,
+    monitor_levels: Option<Receiver<Result<(f32, f32), String>>>,
+    monitor_worker: Option<JoinHandle<()>>,
+    idle_meters: [f32; 2],
     recording_meters: [f32; 2],
     recording_elapsed: Duration,
     recording_errors: Vec<String>,
@@ -141,6 +150,14 @@ impl App {
                 .and_then(|v| v.parse().ok()),
             test_started: false,
             settings_auto_transcribe: config.auto_transcribe(),
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
+            device_refresh: None,
+            device_popups_open: [false; 2],
+            monitor_stop: None,
+            monitor_levels: None,
+            monitor_worker: None,
+            idle_meters: [0.0; 2],
             recording_meters: [0.0; 2],
             recording_elapsed: Duration::ZERO,
             recording_errors: Vec::new(),
@@ -155,11 +172,122 @@ impl App {
             settings_message: None,
         };
         app.refresh_meetings();
+        app.refresh_devices();
         app
     }
 
     fn refresh_meetings(&mut self) {
         self.entries = meetings::list(&self.config.meetings_dir());
+    }
+
+    fn refresh_devices(&mut self) {
+        if self.device_refresh.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.device_refresh = Some(rx);
+        thread::spawn(move || {
+            crate::audio_thread_init();
+            let result = devices::inputs()
+                .and_then(|inputs| devices::outputs().map(|outputs| (inputs, outputs)));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn stop_monitor(&mut self) {
+        if let Some(stop) = self.monitor_stop.take() {
+            let _ = stop.send(());
+        }
+        self.monitor_levels = None;
+        if let Some(worker) = self.monitor_worker.take() {
+            let _ = worker.join();
+        }
+        self.idle_meters = [0.0; 2];
+    }
+
+    fn start_monitor(&mut self) {
+        if self.monitor_stop.is_some() || self.device_refresh.is_some() {
+            return;
+        }
+        let mic = DeviceChoice::from(self.config.mic_device());
+        let output = DeviceChoice::from(self.config.output_device());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (levels_tx, levels_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("idle-audio-monitor".into())
+            .spawn(move || {
+                crate::audio_thread_init();
+                let monitor = match crate::capture::Monitor::start(mic, output) {
+                    Ok(monitor) => monitor,
+                    Err(error) => {
+                        let _ = levels_tx.send(Err(error));
+                        return;
+                    }
+                };
+                loop {
+                    match stop_rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if levels_tx.send(Ok(monitor.levels())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                self.monitor_stop = Some(stop_tx);
+                self.monitor_levels = Some(levels_rx);
+                self.monitor_worker = Some(worker);
+            }
+            Err(error) => self.notice = Some(format!("Could not start audio monitor: {error}")),
+        }
+    }
+
+    fn poll_devices_and_monitor(&mut self) {
+        let devices = self
+            .device_refresh
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("device scan stopped unexpectedly".into()))
+                }
+                Err(TryRecvError::Empty) => None,
+            });
+        if let Some(result) = devices {
+            self.device_refresh = None;
+            match result {
+                Ok((inputs, outputs)) => {
+                    self.input_devices = inputs;
+                    self.output_devices = outputs;
+                }
+                Err(error) => self.notice = Some(format!("Could not list audio devices: {error}")),
+            }
+        }
+        let levels = self
+            .monitor_levels
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(levels) => Some(levels),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("audio monitor stopped unexpectedly".into()))
+                }
+                Err(TryRecvError::Empty) => None,
+            });
+        if let Some(levels) = levels {
+            match levels {
+                Ok((mic, output)) => {
+                    self.idle_meters[0] = smooth_level(self.idle_meters[0], mic);
+                    self.idle_meters[1] = smooth_level(self.idle_meters[1], output);
+                }
+                Err(error) => {
+                    self.notice = Some(format!("Could not monitor audio: {error}"));
+                    self.stop_monitor();
+                }
+            }
+        }
     }
 
     fn select_meeting(&mut self, dir: PathBuf) {
@@ -171,6 +299,7 @@ impl App {
         if self.recorder.is_some() || self.job.is_some() || self.starting.is_some() {
             return;
         }
+        self.stop_monitor();
         let root = self.config.meetings_dir();
         let mic_choice = crate::devices::DeviceChoice::from(self.config.mic_device());
         let output_choice = crate::devices::DeviceChoice::from(self.config.output_device());
@@ -302,6 +431,7 @@ impl App {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
+        self.poll_devices_and_monitor();
         if self
             .recovery
             .as_ref()
@@ -570,7 +700,17 @@ impl App {
             RichText::new("Microphone and computer audio are saved as separate tracks.")
                 .color(Color32::GRAY),
         );
-        ui.add_space(34.0);
+        ui.add_space(22.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Audio devices").strong());
+            if ui.small_button("Refresh devices").clicked() {
+                self.refresh_devices();
+            }
+        });
+        ui.add_space(7.0);
+        self.device_picker(ui, Side::Mic);
+        self.device_picker(ui, Side::Computer);
+        ui.add_space(14.0);
         let active = self.recorder.is_some();
         ui.vertical_centered(|ui| {
             let finalizing = self.job.is_some() || self.starting.is_some();
@@ -613,13 +753,13 @@ impl App {
         ui.add_space(34.0);
         if let Some(recorder) = &self.recorder {
             ui.label(RichText::new(format!("Microphone  ·  {}", recorder.mic_device())).strong());
-            meter(ui, "", self.recording_meters[0]);
-            ui.add_space(17.0);
             ui.label(
-                RichText::new(format!("Computer audio  ·  {}", recorder.computer_device()))
-                    .strong(),
+                RichText::new(format!(
+                    "Output loopback  ·  {}",
+                    recorder.computer_device()
+                ))
+                .strong(),
             );
-            meter(ui, "", self.recording_meters[1]);
         }
         for error in &self.recording_errors {
             ui.add_space(10.0);
@@ -632,6 +772,131 @@ impl App {
         if self.job.is_some() {
             ui.add_space(28.0);
             self.show_job(ui);
+        }
+    }
+
+    fn device_picker(&mut self, ui: &mut egui::Ui, side: Side) {
+        let index = if side == Side::Mic { 0 } else { 1 };
+        let pinned = if index == 0 {
+            self.config.mic_device()
+        } else {
+            self.config.output_device()
+        };
+        let list = if index == 0 {
+            self.input_devices.clone()
+        } else {
+            self.output_devices.clone()
+        };
+        let default_name = list
+            .iter()
+            .find(|device| device.is_default)
+            .map(|device| device.name.clone())
+            .unwrap_or_else(|| {
+                if self.device_refresh.is_some() {
+                    "scanning…".into()
+                } else {
+                    "unavailable".into()
+                }
+            });
+        let chosen = pinned
+            .as_ref()
+            .and_then(|id| list.iter().find(|device| &device.id == id));
+        let selected = match (pinned.as_ref(), chosen) {
+            (None, _) => format!("Follow Windows default ({default_name})"),
+            (Some(_), Some(device)) => device.name.clone(),
+            (Some(_), None) => format!(
+                "{} (unavailable, using default)",
+                pinned.as_deref().unwrap_or_default()
+            ),
+        };
+        let title = if index == 0 {
+            "Microphone"
+        } else {
+            "Output / loopback"
+        };
+        let id_salt = if index == 0 {
+            "mic-device-picker"
+        } else {
+            "output-device-picker"
+        };
+        let was_open = self.device_popups_open[index];
+        let mut new_choice: Option<Option<String>> = None;
+        let enabled = self.recorder.is_none() && self.starting.is_none() && self.job.is_none();
+        let response = ui
+            .horizontal(|ui| {
+                ui.add_sized([110.0, 20.0], egui::Label::new(title));
+                let combo_width = (ui.available_width() - 10.0).clamp(180.0, 420.0);
+                let response = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        egui::ComboBox::from_id_salt(id_salt)
+                            .width(combo_width)
+                            .truncate()
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        pinned.is_none(),
+                                        format!("Follow Windows default ({default_name})"),
+                                    )
+                                    .clicked()
+                                {
+                                    new_choice = Some(None);
+                                }
+                                if pinned.is_some() && chosen.is_none() {
+                                    ui.label(format!(
+                                        "{} (unavailable, using default)",
+                                        pinned.as_deref().unwrap_or_default()
+                                    ));
+                                }
+                                for device in &list {
+                                    if ui
+                                        .selectable_label(
+                                            pinned.as_ref() == Some(&device.id),
+                                            &device.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        new_choice = Some(Some(device.id.clone()));
+                                    }
+                                }
+                            })
+                    })
+                    .inner;
+                response
+            })
+            .inner;
+        let level = if self.recorder.is_some() {
+            self.recording_meters[index]
+        } else {
+            self.idle_meters[index]
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(118.0);
+            meter(ui, level);
+        });
+        let is_open = response.inner.is_some();
+        self.device_popups_open[index] = is_open;
+        if is_open && !was_open {
+            self.refresh_devices();
+        }
+        if let Some(choice) = new_choice {
+            let old = pinned;
+            if index == 0 {
+                self.config.mic_device = choice;
+            } else {
+                self.config.output_device = choice;
+            }
+            match self.config.save() {
+                Ok(()) => self.stop_monitor(),
+                Err(error) => {
+                    if index == 0 {
+                        self.config.mic_device = old;
+                    } else {
+                        self.config.output_device = old;
+                    }
+                    self.notice = Some(format!("Could not save audio device: {error}"));
+                }
+            }
         }
     }
 
@@ -957,7 +1222,7 @@ impl App {
             ui.label("ElevenLabs detects the spoken language.");
             ui.checkbox(
                 &mut self.settings_auto_transcribe,
-                "Transcribe automatically after recording",
+                "Transcribe automatically after stopping",
             );
             ui.add_space(19.0);
 
@@ -1155,6 +1420,17 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.show_close_dialog(&ctx);
         self.poll_background(&ctx);
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        let should_monitor = matches!(self.screen, Screen::Recording)
+            && self.recorder.is_none()
+            && self.starting.is_none()
+            && self.job.is_none()
+            && !minimized;
+        if should_monitor {
+            self.start_monitor();
+        } else {
+            self.stop_monitor();
+        }
         if let Some(seconds) = self.test_seconds {
             if !self.test_started {
                 self.test_started = true;
@@ -1177,6 +1453,8 @@ impl eframe::App for App {
             Screen::Settings => self.show_settings(ui),
         });
         if self.folder_picker.is_some()
+            || self.device_refresh.is_some()
+            || self.monitor_stop.is_some()
             || self.starting.is_some()
             || self.recovery.is_some()
             || self.test_seconds.is_some()
@@ -1192,12 +1470,25 @@ impl eframe::App for App {
     }
 }
 
-fn meter(ui: &mut egui::Ui, _label: &str, value: f32) {
-    ui.add(
-        egui::ProgressBar::new(value.clamp(0.0, 1.0))
-            .desired_width(ui.available_width())
-            .text(format!("{:>3.0}%", value * 100.0)),
-    );
+fn meter(ui: &mut egui::Ui, value: f32) {
+    let value = value.clamp(0.0, 1.0);
+    let dbfs = if value > 0.0 {
+        20.0 * value.log10()
+    } else {
+        f32::NEG_INFINITY
+    };
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::ProgressBar::new(value)
+                .desired_width((ui.available_width() - 90.0).clamp(80.0, 330.0))
+                .text(format!("{:>3.0}%", value * 100.0)),
+        );
+        ui.label(if dbfs.is_finite() && dbfs > -90.0 {
+            format!("{dbfs:.1} dBFS")
+        } else {
+            "silence".into()
+        });
+    });
 }
 
 fn smooth_level(old: f32, target: f32) -> f32 {

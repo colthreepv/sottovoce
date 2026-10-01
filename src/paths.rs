@@ -17,6 +17,12 @@ pub fn models_dir() -> PathBuf {
 
 /// %APPDATA%\MeetingRecorder: config.toml.
 pub fn config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("MEETING_RECORDER_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return path;
+    }
     dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(APP_DIR)

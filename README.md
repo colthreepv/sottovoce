@@ -1,37 +1,42 @@
-# Windows capture MVP
+# Meeting Recorder for Windows
 
-The Windows recorder is a command-line capture MVP. It records the default Windows microphone and the default Windows render endpoint's loopback into separate tracks. The loopback track contains the full output mix, including other system audio alongside meeting audio.
-
-The recordings are intended for later use by an external speech-to-text (STT) tool. This recorder does not transcribe audio or connect to the Omarchy desktop app. It requires FFmpeg on `PATH`, built with the `libopus` encoder.
+The Windows app records the microphone and Windows output loopback as separate Opus tracks. It includes a GUI, a command line interface, speaker diarization, and optional ElevenLabs transcription. FFmpeg with the `libopus` encoder must be available on `PATH`.
 
 ## Run
 
-From the repository root in PowerShell:
+Open the GUI:
 
 ```powershell
-cargo run --release --manifest-path .\windows-recorder\Cargo.toml -- [output-directory]
+cargo run --release --manifest-path .\windows-recorder\Cargo.toml
 ```
 
-The output directory is optional. By default, the recorder creates `recordings\recording-<unix-milliseconds>` relative to the current directory. To stop, press Enter or Ctrl+C; the recorder then finalizes the track files.
+Useful command line commands include `devices`, `record [folder]`, `process <folder>`, `diarize <audio>`, `stt <audio>`, and `selftest`.
 
-## Output
+## Audio device selection
 
-Each recording writes:
+The recording screen has separate Microphone and Output / loopback selectors. Both default to **Follow Windows default**. Select a device to pin it across sessions; the choice is saved immediately. Device selectors are disabled while recording. The live meters show level and dBFS before recording and continue using the recorder's levels during capture. The idle monitor stops while recording and when the recording screen is not active.
 
-```text
-recording-<unix-milliseconds>/
-├── mic.ogg
-├── system.ogg
-└── session.json
+If a pinned device is unavailable or cannot be opened, capture falls back to the Windows default, records the fallback in `session.json`, and retries the pinned device while recording. It returns to the pinned device if it becomes available again. The command `meeting-recorder devices` lists friendly names, stable cpal IDs, defaults, and formats. IDs can be stored in the configuration below.
+
+## Transcription
+
+Stopping a recording saves it and opens its meeting view. Use **Transcribe** in that view to start transcription manually. In Settings, **Transcribe automatically after stopping** enables automatic transcription; it is off by default. ElevenLabs detects the language automatically.
+
+## Configuration and logs
+
+The configuration file is `%APPDATA%\MeetingRecorder\config.toml`. Set `MEETING_RECORDER_CONFIG_DIR` to override the configuration directory, which is useful for isolated runs. Supported audio and transcription keys include:
+
+```toml
+# Omit or set to false to follow the current Windows default.
+mic_device = "wasapi:{0.0.1.00000000}.{device-guid}"
+output_device = "wasapi:{0.0.0.00000000}.{device-guid}"
+
+# Defaults to false.
+auto_transcribe = false
 ```
 
-Each Ogg file is a separate Opus track: `mic.ogg` is the microphone and `system.ogg` is Windows render loopback. Audio is encoded as it is captured, so no large uncompressed intermediate files are written. The recorder preserves each endpoint's channel count, encodes speech-optimized Opus at 32 kbps per channel (64 kbps for stereo), and lets FFmpeg resample to Opus's 48 kHz output rate. `session.json` records the session state, timestamps, device names, input format, encoding settings and duration, dropped callback packets, and xruns.
+Application logs are written to `%LOCALAPPDATA%\MeetingRecorder\logs\YYYY-MM-DD.log`.
 
-ElevenLabs lists OGG and Opus among its supported audio formats in the [Speech to Text documentation](https://elevenlabs.io/docs/overview/capabilities/speech-to-text). Upload `mic.ogg` and `system.ogg` as two separate files; leave `file_format` at its default unless the API reports that it needs an explicit format.
+## Recordings
 
-## Current limitations
-
-- Capture uses only the Windows default input and output devices. There is no device picker.
-- The microphone and render loopback streams start independently. There is no resampling, start-skew alignment, or clock-drift correction; use the session timestamps and durations when comparing the tracks.
-- The recorder needs FFmpeg with `libopus` on `PATH`; it does not bundle the encoder.
-- There is no GUI or STT integration. Upload the saved files to an external STT tool.
+Each meeting folder contains `mic.ogg`, `computer.ogg`, `session.json`, and, after transcription, `meeting.json` and `transcript.md`. Session metadata includes the device names used for each track, duration, silence padding, dropped packets, and xruns.

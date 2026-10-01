@@ -41,6 +41,56 @@ struct OpenSentence {
 /// Builds speakers and paragraphs on the meeting timeline from both sides.
 pub fn build(sides: &[SideInput], your_name: Option<&str>) -> (Vec<Speaker>, Vec<Utterance>) {
     let mut built: Vec<BuiltSide> = sides.iter().map(build_side).collect();
+    let all_sentences: Vec<Sentence> = built
+        .iter()
+        .flat_map(|source| source.sentences.clone())
+        .collect();
+    for source in &mut built {
+        let mut echo_evidence = HashMap::<usize, (usize, usize)>::new();
+        for sentence in &source.sentences {
+            let count = normalized_words(&sentence.text).len();
+            if count >= 3 {
+                let evidence = echo_evidence.entry(sentence.speaker).or_default();
+                evidence.1 += count;
+                if is_echo(sentence, &all_sentences) {
+                    evidence.0 += count;
+                }
+            }
+        }
+        source.sentences.retain(|sentence| {
+            if sentence.side != Side::Mic {
+                return true;
+            }
+            if is_echo(sentence, &all_sentences) {
+                return false;
+            }
+            let leaked_voice = echo_evidence
+                .get(&sentence.speaker)
+                .is_some_and(|(echo, total)| *echo >= 8 && echo * 2 >= *total);
+            let own = normalized_words(&sentence.text);
+            let short_copy = own.len() < 3
+                && all_sentences.iter().any(|other| {
+                    other.side == Side::Computer
+                        && sentence.start_ms.abs_diff(other.start_ms) <= 500
+                        && contains_sequence(&normalized_words(&other.text), &own)
+                });
+            !(leaked_voice && short_copy)
+        });
+        // Word-level diarization can vote for a voice that owns no sentence.
+        // Allocate IDs only after echo filtering, in surviving speech order.
+        let mut first_seen = HashMap::<usize, i64>::new();
+        for sentence in &source.sentences {
+            first_seen
+                .entry(sentence.speaker)
+                .and_modify(|first| *first = (*first).min(sentence.start_ms))
+                .or_insert(sentence.start_ms);
+        }
+        source.speaker_order = first_seen.into_iter().collect();
+        source
+            .speaker_order
+            .sort_by_key(|(speaker, first)| (*first, *speaker));
+        source.offset_ms = 0; // Sentence times already include the track offset.
+    }
     let mut ids = HashMap::<(Side, usize), String>::new();
     let mut speakers_at = Vec::<(i64, usize, usize, Speaker)>::new();
 
@@ -86,16 +136,8 @@ pub fn build(sides: &[SideInput], your_name: Option<&str>) -> (Vec<Speaker>, Vec
         .flat_map(|source| source.sentences)
         .collect();
     sentences.sort_by_key(|sentence| sentence.start_ms);
-    let keep: Vec<bool> = sentences
-        .iter()
-        .map(|sentence| sentence.side != Side::Mic || !is_echo(sentence, &sentences))
-        .collect();
-
     let mut utterances = Vec::<Utterance>::new();
-    for (sentence, keep) in sentences.into_iter().zip(keep) {
-        if !keep {
-            continue;
-        }
+    for sentence in sentences {
         let Some(speaker_id) = ids.get(&(sentence.side, sentence.speaker)) else {
             continue;
         };
@@ -335,35 +377,51 @@ fn turn_start_near(turns: &[Turn], speaker: usize, around_ms: i64) -> Option<i64
 
 fn is_echo(mine: &Sentence, sentences: &[Sentence]) -> bool {
     let own_words = normalized_words(&mine.text);
-    if own_words.is_empty() {
+    // A shared acknowledgement is normal double-talk, not proof of leakage.
+    if own_words.len() < 3 {
         return false;
     }
-    let nearby: Vec<Vec<String>> = sentences
+    sentences
         .iter()
-        .filter(|other| {
-            other.side == Side::Computer
-                && other.start_ms < mine.end_ms.saturating_add(2000)
-                && mine.start_ms < other.end_ms.saturating_add(2000)
+        .filter(|other| other.side == Side::Computer)
+        .any(|other| {
+            let overlap =
+                (mine.end_ms.min(other.end_ms) - mine.start_ms.max(other.start_ms)).max(0);
+            let shorter = (mine.end_ms - mine.start_ms)
+                .min(other.end_ms - other.start_ms)
+                .max(1);
+            let strong_overlap = overlap * 2 >= shorter;
+            let aligned = mine.start_ms.abs_diff(other.start_ms) <= 500;
+            if !strong_overlap && !aligned {
+                return false;
+            }
+            let words = normalized_words(&other.text);
+            let own_numbers: Vec<String> = own_words
+                .iter()
+                .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+                .cloned()
+                .collect();
+            let other_numbers: Vec<String> = words
+                .iter()
+                .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+                .cloned()
+                .collect();
+            if !own_numbers.is_empty() && !contains_sequence(&other_numbers, &own_numbers) {
+                return false;
+            }
+            if contains_sequence(&words, &own_words) {
+                return true;
+            }
+            // With weaker timing evidence require more textual agreement. Compare
+            // each remote sentence separately so unrelated fragments cannot combine.
+            let theirs: HashSet<String> = words.windows(3).map(|w| w.join(" ")).collect();
+            let total = own_words.len() - 2;
+            let matched = own_words
+                .windows(3)
+                .filter(|w| theirs.contains(&w.join(" ")))
+                .count();
+            matched * 100 >= total * if strong_overlap { 50 } else { 85 }
         })
-        .map(|other| normalized_words(&other.text))
-        .collect();
-
-    if own_words.len() < 3 {
-        return nearby
-            .iter()
-            .any(|words| contains_sequence(words, &own_words));
-    }
-    let own_trigrams: Vec<String> = own_words.windows(3).map(|words| words.join(" ")).collect();
-    let their_trigrams: HashSet<String> = nearby
-        .iter()
-        .flat_map(|words| words.windows(3).map(|trigram| trigram.join(" ")))
-        .collect();
-    own_trigrams
-        .iter()
-        .filter(|trigram| their_trigrams.contains(*trigram))
-        .count()
-        * 2
-        >= own_trigrams.len()
 }
 
 fn contains_sequence(haystack: &[String], needle: &[String]) -> bool {
@@ -373,14 +431,127 @@ fn contains_sequence(haystack: &[String], needle: &[String]) -> bool {
             .any(|window| window == needle)
 }
 
+fn number_word(word: &str) -> Option<u32> {
+    const EN: [&str; 20] = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+    ];
+    const IT: [&str; 20] = [
+        "zero",
+        "uno",
+        "due",
+        "tre",
+        "quattro",
+        "cinque",
+        "sei",
+        "sette",
+        "otto",
+        "nove",
+        "dieci",
+        "undici",
+        "dodici",
+        "tredici",
+        "quattordici",
+        "quindici",
+        "sedici",
+        "diciassette",
+        "diciotto",
+        "diciannove",
+    ];
+    if word == "cento" || word == "hundred" {
+        return Some(100);
+    }
+    if let Some(n) = EN
+        .iter()
+        .position(|w| *w == word)
+        .or_else(|| IT.iter().position(|w| *w == word))
+    {
+        return Some(n as u32);
+    }
+    for (en, it, value) in [
+        ("twenty", "venti", 20),
+        ("thirty", "trenta", 30),
+        ("forty", "quaranta", 40),
+        ("fifty", "cinquanta", 50),
+        ("sixty", "sessanta", 60),
+        ("seventy", "settanta", 70),
+        ("eighty", "ottanta", 80),
+        ("ninety", "novanta", 90),
+    ] {
+        if word == en || word == it {
+            return Some(value);
+        }
+        // Italian compounds elide the final vowel before uno/otto.
+        for (unit, name) in IT.iter().enumerate().take(10).skip(1) {
+            let prefix = if unit == 1 || unit == 8 {
+                &it[..it.len() - 1]
+            } else {
+                it
+            };
+            if word == format!("{prefix}{name}") {
+                return Some(value + unit as u32);
+            }
+        }
+    }
+    None
+}
+
 fn normalized_words(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|word| {
-            word.trim_matches(|character: char| !character.is_alphanumeric())
-                .to_lowercase()
-        })
-        .filter(|word| !word.is_empty())
-        .collect()
+    let tokens: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some(mut n) = number_word(&tokens[index]) {
+            // English hyphenated or spaced tens + units, e.g. forty-two.
+            if n >= 20
+                && n % 10 == 0
+                && let Some(unit) = tokens
+                    .get(index + 1)
+                    .and_then(|w| number_word(w))
+                    .filter(|n| *n > 0 && *n < 10)
+            {
+                n += unit;
+                index += 1;
+            }
+            if tokens
+                .get(index + 1)
+                .is_some_and(|w| w == "hundred" || w == "cento")
+                && n > 0
+                && n < 10
+            {
+                n *= 100;
+                index += 1;
+            }
+            result.push(n.to_string());
+        } else {
+            result.push(tokens[index].clone());
+        }
+        index += 1;
+    }
+    result
 }
 
 fn only_audio_events_or_noise(text: &str) -> bool {
@@ -520,6 +691,154 @@ mod tests {
         }
     }
 
+    fn sentence(side: Side, text: &str, start: i64, end: i64) -> Sentence {
+        Sentence {
+            side,
+            text: text.into(),
+            start_ms: start,
+            end_ms: end,
+            track_end_ms: end,
+            speaker: 0,
+        }
+    }
+
+    #[test]
+    fn echo_normalizes_numbers_and_punctuation() {
+        for (mic, remote) in [
+            (
+                "Installs finish in forty seconds now, down from ninety.",
+                "Installs finish in 40 seconds now, down from 90!",
+            ),
+            (
+                "Finisce in quaranta secondi, prima novanta.",
+                "Finisce in 40 secondi; prima 90.",
+            ),
+            ("We have forty-two items.", "We have 42 items."),
+            (
+                "Ci sono ventuno e trentotto elementi.",
+                "Ci sono 21 e 38 elementi.",
+            ),
+        ] {
+            assert!(
+                is_echo(
+                    &sentence(Side::Mic, mic, 100, 4000),
+                    &[sentence(Side::Computer, remote, 120, 4100)]
+                ),
+                "{mic}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_acknowledgements_later_repetitions_and_changed_numbers() {
+        for text in ["Yes.", "Okay!", "Va bene."] {
+            assert!(!is_echo(
+                &sentence(Side::Mic, text, 0, 500),
+                &[sentence(Side::Computer, text, 0, 500)]
+            ));
+        }
+        assert!(!is_echo(
+            &sentence(Side::Mic, "The fix takes forty seconds.", 5000, 7000),
+            &[sentence(
+                Side::Computer,
+                "The fix takes 40 seconds.",
+                0,
+                2000
+            )]
+        ));
+        assert!(!is_echo(
+            &sentence(Side::Mic, "It takes forty seconds.", 0, 2000),
+            &[sentence(Side::Computer, "It takes 90 seconds.", 0, 2000)]
+        ));
+    }
+
+    #[test]
+    fn short_copies_require_long_echo_evidence_from_the_same_voice() {
+        let phrase = "Installs finish in forty seconds now, down from ninety.";
+        let (speakers, utterances) = build(
+            &[
+                side(
+                    Side::Mic,
+                    [words(phrase, 0), words("Okay.", 3000), words("Okay.", 6000)].concat(),
+                    vec![
+                        Turn {
+                            start_ms: 0,
+                            end_ms: 4000,
+                            speaker: 0,
+                        },
+                        Turn {
+                            start_ms: 6000,
+                            end_ms: 8000,
+                            speaker: 1,
+                        },
+                    ],
+                    0,
+                ),
+                side(
+                    Side::Computer,
+                    [words(phrase, 0), words("Okay.", 3000), words("Okay.", 6000)].concat(),
+                    Vec::new(),
+                    0,
+                ),
+            ],
+            None,
+        );
+        let local: Vec<_> = utterances.iter().filter(|u| u.side == Side::Mic).collect();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].start_ms, 6000);
+        assert_eq!(local[0].text, "Okay.");
+        assert_eq!(
+            speakers.iter().find(|s| s.side == Side::Mic).unwrap().name,
+            "You"
+        );
+    }
+
+    #[test]
+    fn removes_ghost_voices_and_renumbers_surviving_speech() {
+        let (speakers, utterances) = build(
+            &[
+                side(
+                    Side::Mic,
+                    [
+                        words("Installs take forty seconds.", 0),
+                        words("I will test tomorrow.", 5000),
+                    ]
+                    .concat(),
+                    vec![
+                        Turn {
+                            start_ms: 0,
+                            end_ms: 3000,
+                            speaker: 0,
+                        },
+                        Turn {
+                            start_ms: 5000,
+                            end_ms: 8000,
+                            speaker: 3,
+                        },
+                    ],
+                    0,
+                ),
+                side(
+                    Side::Computer,
+                    words("Installs take 40 seconds.", 0),
+                    Vec::new(),
+                    0,
+                ),
+            ],
+            None,
+        );
+        assert_eq!(speakers.len(), 2);
+        let local = speakers.iter().find(|s| s.side == Side::Mic).unwrap();
+        assert_eq!(local.id, "you-1");
+        assert_eq!(local.name, "You");
+        assert_eq!(utterances.iter().filter(|u| u.side == Side::Mic).count(), 1);
+        assert!(
+            utterances
+                .iter()
+                .all(|u| speakers.iter().any(|s| s.id == u.speaker))
+        );
+    }
+
     #[test]
     fn interleaves_both_tracks_and_applies_track_offsets() {
         let (speakers, utterances) = build(
@@ -643,7 +962,7 @@ mod tests {
         let (_, utterances) = build(&[input], None);
         assert_eq!(utterances.len(), 1);
         assert_eq!(utterances[0].text, "I think we agree.");
-        assert_eq!(utterances[0].speaker, "remote-2");
+        assert_eq!(utterances[0].speaker, "remote-1");
         assert_eq!(utterances[0].start_ms, 400);
     }
 
