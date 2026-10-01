@@ -96,6 +96,9 @@ pub struct Utterance {
 #[serde(default)]
 pub struct Meeting {
     pub title: String,
+    /// Friendly name of the app that produced the most system audio during the
+    /// recording, when one was detected (see app_audio).
+    pub source_app: Option<String>,
     pub started_at_unix_ms: i64,
     pub duration_ms: i64,
     /// ISO 639 code reported or requested; None for automatic.

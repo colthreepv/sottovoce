@@ -97,6 +97,15 @@ pub enum Event {
     JobCancelled {
         meeting: PathBuf,
     },
+    LibraryBusy {
+        meeting: PathBuf,
+        busy: bool,
+    },
+    LibraryDone {
+        meeting: PathBuf,
+        action: crate::library::Action,
+        output: Option<PathBuf>,
+    },
     MeetingsChanged,
     DevicesChanged {
         devices: Devices,
@@ -122,6 +131,14 @@ pub trait Capture {
     fn devices(&mut self) -> Result<Devices, String> {
         Ok(Devices::default())
     }
+    /// Samples per-app system-audio levels while recording. The default is a
+    /// no-op so test doubles and non-Windows backends need no change.
+    fn sample_app_audio(&mut self, _config: &Config) {}
+    /// Friendly name of the app that produced the most system audio during the
+    /// current recording, if any. Default: unknown.
+    fn source_app(&mut self) -> Option<String> {
+        None
+    }
     fn stop_monitor(&mut self);
 }
 pub trait Processor: Send + Sync + 'static {
@@ -137,6 +154,7 @@ struct AudioCapture {
     recorder: Option<crate::capture::Recorder>,
     monitor: Option<crate::capture::Monitor>,
     reported: usize,
+    app: Option<crate::app_audio::Sampler>,
 }
 impl Capture for AudioCapture {
     fn monitor(&mut self, config: &Config) -> Result<(), String> {
@@ -158,10 +176,20 @@ impl Capture for AudioCapture {
             config.mic_device().into(),
             config.output_device().into(),
         )?);
+        self.app = Some(crate::app_audio::Sampler::new());
         Ok(())
     }
     fn stop(&mut self) -> Result<crate::capture::Session, String> {
+        self.app = None;
         self.recorder.take().ok_or("Not recording")?.stop()
+    }
+    fn sample_app_audio(&mut self, config: &Config) {
+        if let Some(app) = &mut self.app {
+            app.sample(config.output_device().as_deref(), Instant::now());
+        }
+    }
+    fn source_app(&mut self) -> Option<String> {
+        self.app.take().and_then(|app| app.top())
     }
     fn levels(&mut self) -> (f32, f32) {
         self.recorder
@@ -225,6 +253,9 @@ enum Command {
     Mic(Option<String>),
     Output(Option<String>),
     Rename(PathBuf, String, Sender<Result<PathBuf, String>>),
+    DeleteAudio(PathBuf),
+    ArchiveMeeting(PathBuf),
+    LibraryFinished(PathBuf, crate::library::Action, Result<Option<PathBuf>, String>),
     Shutdown,
 }
 struct Work {
@@ -256,6 +287,7 @@ impl Core {
                     recorder: None,
                     monitor: None,
                     reported: 0,
+                    app: None,
                 })
             },
             Arc::new(Pipeline),
@@ -287,6 +319,7 @@ impl Core {
         let actor_snapshot = snapshot.clone();
         let actor_closing = closing.clone();
         let actor_aborts = aborts.clone();
+        let actor_commands = tx.clone();
         let worker = thread::Builder::new()
             .name("sottovoce-core-mta".into())
             .spawn(move || {
@@ -296,12 +329,14 @@ impl Core {
                     closing: actor_closing,
                     aborts: actor_aborts,
                     events,
+                    commands: actor_commands,
                     capture: Some(factory()),
                     dir: None,
                     started: Instant::now(),
                     processor,
                     queue: VecDeque::new(),
                     running: None,
+                    library_busy: std::collections::BTreeSet::new(),
                 };
                 let _ = ready_tx.send(());
                 let result =
@@ -371,6 +406,12 @@ impl Core {
         self.send(Command::Rename(dir, title, tx))?;
         rx.recv().map_err(|_| "Engine stopped".to_string())?
     }
+    pub fn delete_audio(&self, meeting: PathBuf) -> Result<(), String> {
+        self.send(Command::DeleteAudio(meeting))
+    }
+    pub fn archive_meeting(&self, meeting: PathBuf) -> Result<(), String> {
+        self.send(Command::ArchiveMeeting(meeting))
+    }
     pub fn set_mic_device(&self, id: Option<String>) -> Result<(), String> {
         self.send(Command::Mic(id))
     }
@@ -421,12 +462,14 @@ struct Actor {
     closing: Arc<AtomicBool>,
     aborts: Arc<Mutex<BTreeMap<PathBuf, Abort>>>,
     events: Sender<Event>,
+    commands: Sender<Command>,
     capture: Option<Box<dyn Capture>>,
     dir: Option<PathBuf>,
     started: Instant,
     processor: Arc<dyn Processor>,
     queue: VecDeque<Work>,
     running: Option<Running>,
+    library_busy: std::collections::BTreeSet<PathBuf>,
 }
 impl Actor {
     fn emit(&self, event: Event) {
@@ -508,6 +551,9 @@ impl Actor {
         if self.aborts.lock().unwrap().contains_key(&dir) {
             return Err("Meeting already queued or running".into());
         }
+        if self.library_busy.contains(&dir) {
+            return Err("Meeting is being deleted or archived".into());
+        }
         if crate::meetings::entry(&dir).is_none() {
             return Err("Meeting does not exist".into());
         }
@@ -528,6 +574,60 @@ impl Actor {
         });
         self.emit(Event::JobQueued { meeting: dir });
         self.emit(Event::MeetingsChanged);
+        Ok(())
+    }
+    fn rename(&mut self, dir: PathBuf, title: &str) -> Result<PathBuf, String> {
+        if self.dir.as_ref() == Some(&dir)
+            || self.aborts.lock().unwrap().contains_key(&dir)
+            || self.library_busy.contains(&dir)
+        {
+            return Err("Cannot rename an active meeting".into());
+        }
+        crate::meetings::rename(&dir, title)
+    }
+    fn begin_library(&mut self, dir: PathBuf, action: crate::library::Action) -> Result<(), String> {
+        if self.dir.as_ref() == Some(&dir) {
+            return Err("Cannot delete or archive a recording in progress".into());
+        }
+        if self.aborts.lock().unwrap().contains_key(&dir) {
+            return Err("Cannot delete or archive a queued or running transcription".into());
+        }
+        if self.library_busy.contains(&dir) {
+            return Err("Meeting is already being deleted or archived".into());
+        }
+        if crate::meetings::entry(&dir).is_none() {
+            return Err("Meeting does not exist".into());
+        }
+        self.library_busy.insert(dir.clone());
+        self.emit(Event::LibraryBusy {
+            meeting: dir.clone(),
+            busy: true,
+        });
+        let config = self.config();
+        let commands = self.commands.clone();
+        let worker_dir = dir.clone();
+        let finished_dir = dir.clone();
+        let worker = thread::Builder::new()
+            .name("sottovoce-library-operation".into())
+            .spawn(move || {
+                let result = match action {
+                    crate::library::Action::DeleteAudio => {
+                        crate::library::delete_audio(&worker_dir, &config.transcripts_dir())
+                    }
+                    crate::library::Action::Archive => {
+                        crate::library::archive(&worker_dir, &config.archive_dir()).map(Some)
+                    }
+                };
+                let _ = commands.send(Command::LibraryFinished(finished_dir, action, result));
+            });
+        if let Err(error) = worker {
+            self.library_busy.remove(&dir);
+            self.emit(Event::LibraryBusy {
+                meeting: dir,
+                busy: false,
+            });
+            return Err(format!("Could not start library operation: {error}"));
+        }
         Ok(())
     }
     fn terminal(&self, dir: PathBuf, result: Result<Meeting, String>) {
@@ -680,15 +780,20 @@ impl Actor {
     fn stop(&mut self) -> Result<(), String> {
         let dir = self.dir.clone().ok_or("No recording directory")?;
         self.transition(RecordingState::Finalizing)?;
+        let source_app = self.audio().source_app();
         let result = self.audio().stop().and_then(|session| {
             let duration = session
                 .stopped_at_unix_ms
                 .unwrap_or(session.started_at_unix_ms)
                 - session.started_at_unix_ms;
+            let title = source_app
+                .clone()
+                .unwrap_or_else(|| crate::meetings::default_title(session.started_at_unix_ms));
             crate::meetings::save(
                 &dir,
                 &Meeting {
-                    title: crate::meetings::default_title(session.started_at_unix_ms),
+                    title,
+                    source_app: source_app.clone(),
                     started_at_unix_ms: session.started_at_unix_ms,
                     duration_ms: duration,
                     ..Default::default()
@@ -727,6 +832,7 @@ impl Actor {
         self.monitor();
         let mut levels_at = Instant::now();
         let mut poll = Instant::now();
+        let mut app_at = Instant::now();
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 break;
@@ -780,19 +886,36 @@ impl Actor {
                             Ok(())
                         }
                         Command::Rename(dir, title, reply) => {
-                            let result = if self.dir.as_ref() == Some(&dir)
-                                || self.aborts.lock().unwrap().contains_key(&dir)
-                            {
-                                Err("Cannot rename an active meeting".into())
-                            } else {
-                                crate::meetings::rename(&dir, &title)
-                            };
+                            let result = self.rename(dir, &title);
                             if let Err(e) = &result {
                                 self.error(e.clone());
                             } else {
                                 self.emit(Event::MeetingsChanged);
                             }
                             let _ = reply.send(result);
+                            Ok(())
+                        }
+                        Command::DeleteAudio(dir) => {
+                            self.begin_library(dir, crate::library::Action::DeleteAudio)
+                        }
+                        Command::ArchiveMeeting(dir) => {
+                            self.begin_library(dir, crate::library::Action::Archive)
+                        }
+                        Command::LibraryFinished(dir, action, result) => {
+                            self.library_busy.remove(&dir);
+                            self.emit(Event::LibraryBusy {
+                                meeting: dir.clone(),
+                                busy: false,
+                            });
+                            match result {
+                                Ok(output) => self.emit(Event::LibraryDone {
+                                    meeting: dir,
+                                    action,
+                                    output,
+                                }),
+                                Err(message) => self.error(message),
+                            }
+                            self.emit(Event::MeetingsChanged);
                             Ok(())
                         }
                         Command::Shutdown => break,
@@ -813,6 +936,13 @@ impl Actor {
                 self.emit(Event::Levels { mic, system });
                 if self.state() == RecordingState::Recording {
                     self.state_event();
+                }
+            }
+            if app_at.elapsed() >= Duration::from_secs(1) {
+                app_at = Instant::now();
+                if self.state() == RecordingState::Recording {
+                    let config = self.config();
+                    self.audio().sample_app_audio(&config);
                 }
             }
             let (errors, fatal) = self.audio().errors();

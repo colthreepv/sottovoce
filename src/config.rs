@@ -17,6 +17,10 @@ pub struct Config {
     pub language: Option<String>,
     /// Folder that holds one folder per meeting.
     pub meetings_dir: Option<PathBuf>,
+    /// Folder for Markdown exports of deleted meetings.
+    pub transcripts_dir: Option<PathBuf>,
+    /// Folder for archived meeting zip files.
+    pub archive_dir: Option<PathBuf>,
     /// Your own name, used for the mic speaker when there is one voice.
     pub your_name: Option<String>,
     /// Find several voices per side with Nemotron (default true).
@@ -127,6 +131,18 @@ impl Config {
         self.diarize.unwrap_or(true)
     }
 
+    pub fn transcripts_dir(&self) -> PathBuf {
+        self.transcripts_dir
+            .clone()
+            .unwrap_or_else(crate::paths::default_transcripts_dir)
+    }
+
+    pub fn archive_dir(&self) -> PathBuf {
+        self.archive_dir
+            .clone()
+            .unwrap_or_else(crate::paths::default_archive_dir)
+    }
+
     pub fn auto_transcribe(&self) -> bool {
         self.auto_transcribe.unwrap_or(false)
     }
@@ -157,4 +173,6 @@ output_device = ""
 # Optional settings (uncomment to override):
 # your_name = "Valerio"
 # meetings_dir = 'C:\Users\Valerio\Documents\Meetings'
+# transcripts_dir = 'C:\Users\Valerio\Documents\Meeting Transcriptions'
+# archive_dir = 'C:\Users\Valerio\Documents\Meeting Archive'
 "#;

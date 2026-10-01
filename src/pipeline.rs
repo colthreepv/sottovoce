@@ -129,6 +129,7 @@ pub fn process(
         started_at_unix_ms: started,
         duration_ms,
         language,
+        source_app: previous.as_ref().and_then(|m| m.source_app.clone()),
         stt_model: options.stt.model_id.clone(),
         speakers,
         utterances,

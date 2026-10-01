@@ -99,6 +99,8 @@ impl Harness {
         std::fs::create_dir_all(&root).unwrap();
         Config {
             meetings_dir: Some(root.join("meetings")),
+            transcripts_dir: Some(root.join("transcripts")),
+            archive_dir: Some(root.join("archive")),
             ..Default::default()
         }
         .save_at(&root.join("config.toml"))
@@ -196,6 +198,74 @@ impl Drop for Harness {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn library_busy_meetings_refuse_rename_transcription_and_second_operation() {
+    let h = Harness::new(false, false, false);
+    let dir = h.root.join("meetings").join("meeting");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::capture::Session {
+        status: "completed".into(),
+        started_at_unix_ms: 1,
+        stopped_at_unix_ms: Some(2),
+        ..Default::default()
+    }
+    .save(&dir)
+    .unwrap();
+    crate::meetings::save(
+        &dir,
+        &Meeting {
+            title: "Busy test".into(),
+            started_at_unix_ms: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::write(dir.join("mic.ogg"), b"mic").unwrap();
+    std::fs::write(dir.join("computer.ogg"), b"computer").unwrap();
+    let (events, event_receiver) = mpsc::channel();
+    let (commands, command_receiver) = mpsc::channel();
+    let mut actor = Actor {
+        path: h.root.join("config.toml"),
+        snapshot: Arc::new(Mutex::new(Snapshot {
+            config: h.core.get_config(),
+            state: RecordingState::Ready,
+            jobs: BTreeMap::new(),
+            devices: Devices::default(),
+        })),
+        closing: Arc::new(AtomicBool::new(false)),
+        aborts: Arc::new(Mutex::new(BTreeMap::new())),
+        events,
+        commands,
+        capture: None,
+        dir: None,
+        started: Instant::now(),
+        processor: Arc::new(Pipeline),
+        queue: VecDeque::new(),
+        running: None,
+        library_busy: std::collections::BTreeSet::new(),
+    };
+    actor
+        .begin_library(dir.clone(), crate::library::Action::Archive)
+        .unwrap();
+    assert!(matches!(
+        event_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Event::LibraryBusy { meeting, busy: true } if meeting == dir
+    ));
+    assert!(actor.rename(dir.clone(), "Renamed").is_err());
+    assert!(actor.enqueue(dir.clone()).is_err());
+    assert!(
+        actor
+            .begin_library(dir.clone(), crate::library::Action::DeleteAudio)
+            .is_err()
+    );
+    assert!(matches!(
+        command_receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Command::LibraryFinished(meeting, crate::library::Action::Archive, Ok(Some(_)))
+            if meeting == dir
+    ));
+    h.close();
 }
 #[test]
 fn transition_table_is_explicit() {

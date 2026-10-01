@@ -4,20 +4,7 @@
 //! Nemotron 3 Diarization, transcribes them with ElevenLabs and shows the
 //! conversation.
 
-mod capture;
-mod config;
-pub mod core;
-mod devices;
-mod diarize;
-mod elevenlabs;
-mod ffmpeg;
-mod meetings;
-mod nemotron;
-mod paths;
-mod pipeline;
-mod player;
-mod transcript;
-mod types;
+use sottovoce_engine::{capture, config, core, devices, diarize, elevenlabs, ffmpeg, meetings, pipeline, player, transcript, types};
 mod ui;
 
 use std::path::PathBuf;
@@ -26,43 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use types::{Abort, Event};
 
-pub const APP_NAME: &str = "Meeting Recorder";
-
-pub fn log_event(message: &str) {
-    use std::io::Write;
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let Ok(_guard) = LOCK.lock() else { return };
-    let dir = paths::data_dir().join("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("{}.log", chrono::Local::now().format("%Y-%m-%d")));
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(
-            file,
-            "{} [pid {}] {message}",
-            chrono::Local::now().to_rfc3339(),
-            std::process::id()
-        );
-    }
-}
-
-/// CPAL defaults to STA; WASAPI workers use MTA to avoid GUI message-pump dependencies.
-pub fn audio_thread_init() {
-    #[cfg(windows)]
-    unsafe {
-        #[link(name = "ole32")]
-        unsafe extern "system" {
-            fn CoInitializeEx(reserved: *mut std::ffi::c_void, mode: u32) -> i32;
-        }
-        let result = CoInitializeEx(std::ptr::null_mut(), 0);
-        if result < 0 {
-            log_event(&format!("Audio COM initialization: {result:#x}"));
-        }
-    }
-}
+pub use sottovoce_engine::{APP_NAME, log_event, audio_thread_init};
 
 fn main() {
     std::panic::set_hook(Box::new(|panic| log_event(&format!("PANIC: {panic}"))));

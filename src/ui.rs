@@ -288,6 +288,14 @@ impl App {
                     }
                     self.refresh_meetings();
                 }
+                CoreEvent::LibraryBusy { .. } => self.refresh_meetings(),
+                CoreEvent::LibraryDone { meeting, .. } => {
+                    self.refresh_meetings();
+                    if matches!(&self.screen, Screen::Meeting(dir) if *dir == meeting) {
+                        self.meeting_cache = None;
+                        self.screen = Screen::Recording;
+                    }
+                }
                 CoreEvent::Error { message } => self.notice = Some(message),
                 CoreEvent::ShutdownComplete => {
                     self.allow_close = true;

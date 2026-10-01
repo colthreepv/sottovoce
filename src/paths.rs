@@ -35,3 +35,17 @@ pub fn default_meetings_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("Meetings")
 }
+
+pub fn default_transcripts_dir() -> PathBuf {
+    dirs::document_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Meeting Transcriptions")
+}
+
+pub fn default_archive_dir() -> PathBuf {
+    dirs::document_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Meeting Archive")
+}
