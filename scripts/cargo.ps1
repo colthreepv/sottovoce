@@ -15,6 +15,7 @@
   - CARGO_TARGET_DIR defaults to %TEMP%\sottovoce-<role>-target, so roles never
     share or clobber a target, and nothing is written to the user's builds.
 #>
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Role = $(if ($env:SOTTOVOCE_ROLE) { $env:SOTTOVOCE_ROLE } else { 'dev' }),
     [int]$Slots = 2,
@@ -51,4 +52,3 @@ finally {
     $semaphore.Dispose()
 }
 exit $code
-

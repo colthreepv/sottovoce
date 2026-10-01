@@ -3,3 +3,7 @@
 /packaging/dist/
 /packaging/build-cache/
 /AGENTS.md
+
+/app/ui/node_modules/
+/app/ui/dist/
+/app/src-tauri/gen/

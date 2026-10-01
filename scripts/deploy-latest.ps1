@@ -2,7 +2,9 @@
 param(
     [string]$BuildRoot,
     [int]$KeepBuilds = 3,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$TargetDirectory = (Join-Path $env:TEMP 'sottovoce-deploy-target'),
+    [ValidateSet("debug", "release")][string]$Profile = "release"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,8 +12,9 @@ Set-StrictMode -Version Latest
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $manifestPath = Join-Path $repoRoot 'Cargo.toml'
-$targetDirectory = Join-Path $env:TEMP 'sottovoce-deploy-target'
+$targetDirectory = [IO.Path]::GetFullPath($TargetDirectory)
 $artifactDefinitions = @(
+    @{ Name = 'sottovoce.exe'; Source = { param($releaseDir) Join-Path $releaseDir 'sottovoce.exe' }; Required = $true },
     @{ Name = 'meeting-recorder.exe'; Source = { param($releaseDir) Join-Path $releaseDir 'meeting-recorder.exe' }; Required = $true },
     @{ Name = 'ffmpeg.exe'; Source = { param($releaseDir) Join-Path $repoRoot 'packaging\dist\ffmpeg.exe' }; Required = $false }
 )
@@ -24,7 +27,8 @@ if ([string]::IsNullOrWhiteSpace($BuildRoot)) { throw 'BuildRoot cannot be empty
 $BuildRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($BuildRoot))
 [void][IO.Directory]::CreateDirectory($BuildRoot)
 
-$metadataOutput = & cargo metadata --no-deps --format-version 1 --manifest-path $manifestPath
+$metadataOutput = & (Join-Path $PSScriptRoot 'cargo.ps1') -Role adept -CargoArgs @('metadata', '--no-deps', '--format-version', '1', '--manifest-path', $manifestPath)
+$metadataOutput = @($metadataOutput | Where-Object { -not ([string]$_).StartsWith('[cargo.ps1]') })
 if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE." }
 $metadata = ($metadataOutput -join [Environment]::NewLine) | ConvertFrom-Json
 $package = $metadata.packages | Where-Object { $_.name -eq 'meeting-recorder-windows' } | Select-Object -First 1
@@ -43,7 +47,11 @@ $baseBuildId = "$($package.version)-$shortCommit$(if ($dirty) { '-dirty' })"
 
 if (-not $SkipBuild) {
     Write-Host "Building Sottovoce $($package.version) into '$targetDirectory'..."
-    & cargo build --release --locked --manifest-path $manifestPath --target-dir $targetDirectory
+    & bun run --cwd (Join-Path $repoRoot 'app/ui') build
+    if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
+    $buildArgs = @('build', '--workspace', '--locked', '--manifest-path', $manifestPath, '--target-dir', $targetDirectory)
+    if ($Profile -eq 'release') { $buildArgs += '--release' }
+    & (Join-Path $PSScriptRoot 'cargo.ps1') -Role adept -CargoArgs $buildArgs
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE." }
     $builtCommit = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
     if ($LASTEXITCODE -ne 0 -or ([string]$builtCommit).Trim() -ne $sourceCommit) {
@@ -56,7 +64,7 @@ if (-not $SkipBuild) {
     }
 }
 
-$releaseDirectory = Join-Path $targetDirectory 'release'
+$releaseDirectory = Join-Path $targetDirectory $Profile
 $resolvedArtifacts = @()
 foreach ($definition in $artifactDefinitions) {
     $source = & $definition.Source $releaseDirectory
@@ -98,6 +106,16 @@ try {
         buildTimeUtc = [DateTime]::UtcNow.ToString('o')
         rustcVersion = $rustcVersion
         cargoVersion = ([string]$cargoVersion).Trim()
+    }
+    $buildInfo.profile = $Profile
+    # Web assets and capabilities are compiled into sottovoce.exe. Tauri build
+    # output may also contain runtime DLLs and a resources directory.
+    Get-ChildItem -LiteralPath $releaseDirectory -Filter '*.dll' -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stagingPath $_.Name)
+    }
+    $resources = Join-Path $releaseDirectory 'resources'
+    if (Test-Path -LiteralPath $resources -PathType Container) {
+        Copy-Item -LiteralPath $resources -Destination (Join-Path $stagingPath 'resources') -Recurse
     }
     $json = $buildInfo | ConvertTo-Json
     [IO.File]::WriteAllText((Join-Path $stagingPath 'build.json'), $json, [Text.UTF8Encoding]::new($false))
@@ -146,15 +164,17 @@ try {
 
 $runningPaths = @()
 try {
-    $runningPaths = @(Get-CimInstance Win32_Process -Filter "Name = 'meeting-recorder.exe'" -ErrorAction Stop |
+    $runningPaths = @(Get-CimInstance Win32_Process -Filter "Name = 'meeting-recorder.exe' OR Name = 'sottovoce.exe'" -ErrorAction Stop |
         ForEach-Object { $_.ExecutablePath } | Where-Object { $_ })
 } catch {
-    $runningPaths = @(Get-Process -Name meeting-recorder -ErrorAction SilentlyContinue |
+    $runningPaths = @(Get-Process -Name meeting-recorder,sottovoce -ErrorAction SilentlyContinue |
         ForEach-Object { try { $_.Path } catch { $null } } | Where-Object { $_ })
 }
 $runningPaths = @($runningPaths | ForEach-Object { [IO.Path]::GetFullPath($_) })
-if ($previousBuildId -and $runningPaths -contains [IO.Path]::GetFullPath((Join-Path $latestPath 'meeting-recorder.exe'))) {
-    $runningPaths += [IO.Path]::GetFullPath((Join-Path (Join-Path $BuildRoot $previousBuildId) 'meeting-recorder.exe'))
+foreach ($executable in @('meeting-recorder.exe', 'sottovoce.exe')) {
+    if ($previousBuildId -and $runningPaths -contains [IO.Path]::GetFullPath((Join-Path $latestPath $executable))) {
+        $runningPaths += [IO.Path]::GetFullPath((Join-Path (Join-Path $BuildRoot $previousBuildId) $executable))
+    }
 }
 
 $managedBuilds = @()
@@ -173,8 +193,8 @@ $keepIds += $buildId
 foreach ($build in $orderedBuilds) {
     $id = Split-Path -Leaf $build.Path
     if ($keepIds -contains $id) { continue }
-    $exePath = [IO.Path]::GetFullPath((Join-Path $build.Path 'meeting-recorder.exe'))
-    if ($runningPaths -contains $exePath) {
+    $exePaths = @('meeting-recorder.exe', 'sottovoce.exe') | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $build.Path $_)) }
+    if (@($exePaths | Where-Object { $runningPaths -contains $_ }).Count -gt 0) {
         Write-Host "Keeping running build $id."
         continue
     }
@@ -186,5 +206,5 @@ foreach ($build in $orderedBuilds) {
     }
 }
 
-Write-Host "Sottovoce $($package.version) is available at '$latestPath\meeting-recorder.exe'."
+Write-Host "Sottovoce $($package.version) is available at '$latestPath\sottovoce.exe'."
 Write-Host "Build metadata: '$latestPath\build.json'."
