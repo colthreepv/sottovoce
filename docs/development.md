@@ -3,6 +3,20 @@
 This document covers local development and deployment details. User setup and
 recording instructions are in the [README](../README.md).
 
+## Compiling without freezing the PC
+
+Run cargo through the wrapper, never bare:
+
+```powershell
+pwsh -File scripts/cargo.ps1 -Role dev test
+pwsh -File scripts/cargo.ps1 -Role adept check --workspace
+```
+
+It runs cargo and every compiler process at BelowNormal priority, uses a
+per-role target directory under `%TEMP%`, and lets at most two cargo runs
+execute at once machine-wide through a named semaphore; extra runs wait for a
+slot. This matters when several agents work in parallel.
+
 ## Build and launch locally
 
 Use the deployment helper to build a locked release and stage it under a
