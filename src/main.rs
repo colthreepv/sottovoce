@@ -6,6 +6,7 @@
 
 mod capture;
 mod config;
+mod devices;
 mod diarize;
 mod elevenlabs;
 mod ffmpeg;
@@ -26,7 +27,45 @@ use types::{Abort, Event};
 
 pub const APP_NAME: &str = "Meeting Recorder";
 
+pub fn log_event(message: &str) {
+    use std::io::Write;
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_guard) = LOCK.lock() else { return };
+    let dir = paths::data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.log", chrono::Local::now().format("%Y-%m-%d")));
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{} [pid {}] {message}",
+            chrono::Local::now().to_rfc3339(),
+            std::process::id()
+        );
+    }
+}
+
+/// CPAL defaults to STA; WASAPI workers use MTA to avoid GUI message-pump dependencies.
+pub fn audio_thread_init() {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoInitializeEx(reserved: *mut std::ffi::c_void, mode: u32) -> i32;
+        }
+        let result = CoInitializeEx(std::ptr::null_mut(), 0);
+        if result < 0 {
+            log_event(&format!("Audio COM initialization: {result:#x}"));
+        }
+    }
+}
+
 fn main() {
+    std::panic::set_hook(Box::new(|panic| log_event(&format!("PANIC: {panic}"))));
+    log_event("Application started");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         if let Err(e) = ui::run() {
@@ -36,19 +75,128 @@ fn main() {
         return;
     }
     attach_console();
-    let result = match args[0].as_str() {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", usage());
+        return;
+    }
+    let result = validate_args(&args).and_then(|()| match args[0].as_str() {
         "record" => cli_record(&args[1..]),
         "process" => cli_process(&args[1..]),
         "diarize" => cli_diarize(&args[1..]),
         "stt" => cli_stt(&args[1..]),
         "devices" => cli_devices(),
         "selftest" => cli_selftest(),
+        "gui-record-test" => cli_gui_record_test(&args[1]),
         _ => Err(usage()),
-    };
+    });
     if let Err(e) = result {
+        log_event(&format!("Error: {e}"));
         eprintln!("{e}");
         std::process::exit(1);
     }
+}
+
+fn validate_args(args: &[String]) -> Result<(), String> {
+    let (minimum, maximum, allowed): (usize, usize, &[&str]) = match args[0].as_str() {
+        "record" => (0, 1, &[]),
+        "process" => (1, 1, &[]),
+        "diarize" => (1, 1, &["--speakers", "-s"]),
+        "stt" => (1, 1, &["--language", "-l"]),
+        "devices" | "selftest" => (0, 0, &[]),
+        "gui-record-test" => (1, 1, &[]),
+        _ => return Err(usage()),
+    };
+    let mut positional = 0;
+    let mut iter = args[1..].iter();
+    while let Some(arg) = iter.next() {
+        if allowed.contains(&arg.as_str()) {
+            let value = iter
+                .next()
+                .filter(|v| !v.starts_with('-'))
+                .ok_or_else(|| format!("{arg} needs a value"))?;
+            if matches!(arg.as_str(), "--speakers" | "-s")
+                && value.parse::<usize>().ok().filter(|n| *n > 0).is_none()
+            {
+                return Err("--speakers needs a positive integer".into());
+            }
+        } else if arg.starts_with('-') {
+            return Err(format!("Unknown option: {arg}"));
+        } else {
+            positional += 1;
+        }
+    }
+    if positional < minimum || positional > maximum {
+        return Err(usage());
+    }
+    if args[0] == "gui-record-test"
+        && args[1]
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0 && *n <= 600)
+            .is_none()
+    {
+        return Err("gui-record-test needs seconds in 1..=600".into());
+    }
+    Ok(())
+}
+
+fn cli_gui_record_test(seconds: &str) -> Result<(), String> {
+    let root = std::env::temp_dir().join(format!("mr-gui-test-{}", capture::unix_ms()));
+    let meetings_root = root.join("meetings");
+    let tone_dir = root.join("tone");
+    std::fs::create_dir_all(&tone_dir).map_err(|e| e.to_string())?;
+    let status = ffmpeg::command()
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:sample_rate=48000",
+            "-t",
+            &(seconds.parse::<u64>().unwrap_or(5) + 10).to_string(),
+            "-c:a",
+            "libopus",
+        ])
+        .arg(tone_dir.join("computer.ogg"))
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("could not create test tone".into());
+    }
+    // Set the test environment before any workers are spawned.
+    unsafe {
+        std::env::set_var("MR_GUI_RECORD_TEST_SECONDS", seconds);
+        std::env::set_var("MR_GUI_TEST_DIR", &meetings_root);
+    }
+    let tone = player::Player::new(&tone_dir);
+    tone.play_from(0);
+    log_event(&format!("GUI recording test: {}", root.display()));
+    ui::run()?;
+    drop(tone);
+    let entry = meetings::list(&meetings_root)
+        .into_iter()
+        .next()
+        .ok_or("GUI test produced no meeting")?;
+    let session = capture::Session::load(&entry.dir).ok_or("GUI test produced no session")?;
+    if session.status != "completed" {
+        return Err(format!("GUI test: session {}", session.status));
+    }
+    for side in [types::Side::Mic, types::Side::Computer] {
+        let samples = ffmpeg::decode_mono_16k(&entry.dir.join(side.file_name()))?;
+        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let report = format!(
+            "GUI test {}: {} samples, peak {:.1} dBFS, {}",
+            side.label(),
+            samples.len(),
+            20.0 * peak.max(1e-6).log10(),
+            entry.dir.display()
+        );
+        println!("{report}");
+        log_event(&report);
+        if samples.is_empty() || (side == types::Side::Computer && peak < 0.01) {
+            return Err("GUI recording test did not capture the tone".into());
+        }
+    }
+    Ok(())
 }
 
 fn usage() -> String {
@@ -106,7 +254,11 @@ fn cli_record(args: &[String]) -> Result<(), String> {
         Some(dir) => PathBuf::from(dir),
         None => meetings::new_dir(&config.meetings_dir(), capture::unix_ms()),
     };
-    let mut recorder = capture::Recorder::start(&dir)?;
+    let mut recorder = capture::Recorder::start(
+        &dir,
+        devices::DeviceChoice::from(config.mic_device()),
+        devices::DeviceChoice::from(config.output_device()),
+    )?;
     println!("Recording to {}", dir.display());
     println!("Microphone: {}", recorder.mic_device());
     println!("Computer audio: {}", recorder.computer_device());
@@ -135,7 +287,10 @@ fn cli_record(args: &[String]) -> Result<(), String> {
     }
     eprintln!();
     let session = recorder.stop()?;
-    println!("{}", serde_json::to_string_pretty(&session).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&session).unwrap_or_default()
+    );
     if session.status != "completed" {
         return Err("the recording ended with errors".into());
     }
@@ -178,7 +333,10 @@ fn cli_diarize(args: &[String]) -> Result<(), String> {
         started.elapsed().as_secs_f64(),
         samples.len() as f64 / 16_000.0
     );
-    println!("{}", serde_json::to_string_pretty(&turns).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&turns).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -220,11 +378,21 @@ fn cli_devices() -> Result<(), String> {
     println!("default output: {}", default_out.unwrap_or_default());
     for device in host.output_devices().map_err(|e| e.to_string())? {
         let config = device.default_output_config().map(|c| format!("{c:?}"));
-        println!("output: {}  {}", name(&device), config.unwrap_or_else(|e| e.to_string()));
+        println!(
+            "output: {}  id={}  {}",
+            name(&device),
+            device.id().map(|id| id.to_string()).unwrap_or_default(),
+            config.unwrap_or_else(|e| e.to_string())
+        );
     }
     for device in host.input_devices().map_err(|e| e.to_string())? {
         let config = device.default_input_config().map(|c| format!("{c:?}"));
-        println!("input:  {}  {}", name(&device), config.unwrap_or_else(|e| e.to_string()));
+        println!(
+            "input:  {}  id={}  {}",
+            name(&device),
+            device.id().map(|id| id.to_string()).unwrap_or_default(),
+            config.unwrap_or_else(|e| e.to_string())
+        );
     }
     Ok(())
 }
@@ -233,8 +401,13 @@ fn cli_devices() -> Result<(), String> {
 /// then reports the peak of both tracks: the computer track must hear the tone.
 fn cli_selftest() -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let dir = std::env::temp_dir().join(format!("meeting-recorder-selftest-{}", capture::unix_ms()));
-    let recorder = capture::Recorder::start(&dir)?;
+    let dir =
+        std::env::temp_dir().join(format!("meeting-recorder-selftest-{}", capture::unix_ms()));
+    let recorder = capture::Recorder::start(
+        &dir,
+        devices::DeviceChoice::FollowDefault,
+        devices::DeviceChoice::FollowDefault,
+    )?;
     println!("Recording to {}", dir.display());
     let device = cpal::default_host()
         .default_output_device()
@@ -273,7 +446,32 @@ fn cli_selftest() -> Result<(), String> {
             20.0 * peak.max(1e-6).log10()
         );
     }
-    println!("{}", serde_json::to_string_pretty(&session).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&session).unwrap_or_default()
+    );
     Ok(())
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn rejects_unknown_flags_and_excess_paths() {
+        for input in [
+            vec!["record", "--bogus"],
+            vec!["devices", "extra"],
+            vec!["process", "one", "two"],
+            vec!["diarize", "a", "--speakers"],
+            vec!["diarize", "a", "-s", "0"],
+            vec!["stt", "a", "--bogus"],
+        ] {
+            assert!(validate_args(&args(&input)).is_err(), "{input:?}");
+        }
+        assert!(validate_args(&args(&["record"])).is_ok());
+        assert!(validate_args(&args(&["diarize", "a", "-s", "2"])).is_ok());
+    }
+}

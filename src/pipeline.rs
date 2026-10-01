@@ -24,7 +24,7 @@ impl Options {
             stt: SttOptions {
                 api_key,
                 model_id: config.stt_model(),
-                language: config.language(),
+                language: None,
             },
             diarize: config.diarize(),
             your_name: config.your_name.clone().filter(|n| !n.trim().is_empty()),
@@ -45,7 +45,12 @@ fn check(abort: &Abort) -> Result<(), String> {
 
 /// Transcribes the meeting in `dir` and saves meeting.json and transcript.md.
 /// Speaker names already given are kept for speakers that still exist.
-pub fn process(dir: &Path, options: &Options, events: &Events, abort: &Abort) -> Result<Meeting, String> {
+pub fn process(
+    dir: &Path,
+    options: &Options,
+    events: &Events,
+    abort: &Abort,
+) -> Result<Meeting, String> {
     let session = crate::capture::Session::load(dir).unwrap_or_default();
     let previous = crate::meetings::load(dir);
     let mut sides = Vec::new();
@@ -84,9 +89,14 @@ pub fn process(dir: &Path, options: &Options, events: &Events, abort: &Abort) ->
         drop(samples);
 
         check(abort)?;
-        let _ = events.send(Event::Stage(format!("Transcribing with ElevenLabs ({who})")));
+        let _ = events.send(Event::Stage(format!(
+            "Transcribing with ElevenLabs ({who})"
+        )));
         let _ = events.send(Event::Progress(0.0));
-        let cache = dir.join(format!(".stt-{}.json", side.file_name().trim_end_matches(".ogg")));
+        let cache = dir.join(format!(
+            ".stt-{}.json",
+            side.file_name().trim_end_matches(".ogg")
+        ));
         let stt = crate::elevenlabs::transcribe_file(&path, &options.stt, Some(&cache), abort)?;
         if language.is_none() {
             language = stt.language_code.clone();
@@ -101,8 +111,7 @@ pub fn process(dir: &Path, options: &Options, events: &Events, abort: &Abort) ->
     }
 
     let _ = events.send(Event::Stage("Building the conversation".into()));
-    let (mut speakers, utterances) =
-        crate::transcript::build(&sides, options.your_name.as_deref());
+    let (mut speakers, utterances) = crate::transcript::build(&sides, options.your_name.as_deref());
     if let Some(previous) = &previous {
         for speaker in &mut speakers {
             if let Some(old) = previous.speakers.iter().find(|s| s.id == speaker.id) {
@@ -128,6 +137,7 @@ pub fn process(dir: &Path, options: &Options, events: &Events, abort: &Abort) ->
         speakers,
         utterances,
     };
+    check(abort)?;
     crate::meetings::save(dir, &meeting)?;
     let _ = events.send(Event::Stage("Done".into()));
     Ok(meeting)

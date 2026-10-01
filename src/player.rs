@@ -23,7 +23,7 @@ struct Shared {
 /// Plays the two tracks of a meeting, mixing them into stereo.
 pub struct Player {
     shared: Arc<Shared>,
-    _stream: Option<cpal::Stream>,
+    _quit: std::sync::mpsc::Sender<()>,
 }
 
 impl Player {
@@ -43,18 +43,27 @@ impl Player {
             .name("meeting-playback-decode".into())
             .spawn(move || decode_tracks(path, decode_shared));
 
-        let stream = match open_output(Arc::clone(&shared)) {
-            Ok(stream) => Some(stream),
-            Err(error) => {
-                if let Ok(mut slot) = shared.error.lock() {
-                    *slot = Some(error);
+        let (quit, rx) = std::sync::mpsc::channel();
+        let output_shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            crate::audio_thread_init();
+            // WASAPI objects never originate in winit's STA apartment.
+            match open_output(Arc::clone(&output_shared)) {
+                Ok(stream) => {
+                    let _ = rx.recv();
+                    drop(stream);
                 }
-                None
+                Err(error) => {
+                    crate::log_event(&error);
+                    if let Ok(mut slot) = output_shared.error.lock() {
+                        *slot = Some(error);
+                    }
+                }
             }
-        };
+        });
         Player {
             shared,
-            _stream: stream,
+            _quit: quit,
         }
     }
 
@@ -204,11 +213,12 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let error_shared = Arc::clone(&shared);
+    let callback_error = Arc::clone(&shared);
     device
         .build_output_stream(
             config,
             move |output: &mut [T], _| {
-                let Ok(buffer) = shared.samples.lock() else {
+                let Ok(buffer) = shared.samples.try_lock() else {
                     for sample in output {
                         *sample = T::from_sample(0.0);
                     }
@@ -252,7 +262,12 @@ where
                     }
                 }
             },
-            move |_| {},
+            move |error| {
+                if let Ok(mut slot) = callback_error.error.lock() {
+                    *slot = Some(format!("Playback failed: {error}"));
+                }
+                callback_error.playing.store(false, Ordering::Relaxed);
+            },
             Some(Duration::from_millis(100)),
         )
         .map_err(|e| format!("could not open output stream: {e}"))

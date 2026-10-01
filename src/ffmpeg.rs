@@ -11,7 +11,10 @@ pub fn path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        for candidate in [dir.join("ffmpeg.exe"), dir.join("ffmpeg").join("ffmpeg.exe")] {
+        for candidate in [
+            dir.join("ffmpeg.exe"),
+            dir.join("ffmpeg").join("ffmpeg.exe"),
+        ] {
             if candidate.is_file() {
                 return candidate;
             }

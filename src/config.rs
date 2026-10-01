@@ -21,6 +21,12 @@ pub struct Config {
     pub your_name: Option<String>,
     /// Find several voices per side with Nemotron (default true).
     pub diarize: Option<bool>,
+    /// Transcribe automatically after a recording stops (default false).
+    pub auto_transcribe: Option<bool>,
+    /// Stable cpal device id, or None to follow the Windows default.
+    pub mic_device: Option<String>,
+    /// Stable cpal render device id, or None to follow the Windows default.
+    pub output_device: Option<String>,
 }
 
 impl Config {
@@ -75,5 +81,19 @@ impl Config {
 
     pub fn diarize(&self) -> bool {
         self.diarize.unwrap_or(true)
+    }
+
+    pub fn auto_transcribe(&self) -> bool {
+        self.auto_transcribe.unwrap_or(false)
+    }
+
+    pub fn mic_device(&self) -> Option<String> {
+        self.mic_device.clone().filter(|id| !id.trim().is_empty())
+    }
+
+    pub fn output_device(&self) -> Option<String> {
+        self.output_device
+            .clone()
+            .filter(|id| !id.trim().is_empty())
     }
 }

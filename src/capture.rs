@@ -25,6 +25,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, SupportedStreamConfig};
 use serde::{Deserialize, Serialize};
 
+use crate::devices::{self, DeviceChoice};
 use crate::types::Side;
 
 const QUEUE_PACKETS: usize = 256;
@@ -172,9 +173,118 @@ pub struct Recorder {
     errors: Vec<String>,
 }
 
+/// Lightweight live level monitor. Streams and supervisors are joined on drop.
+pub struct Monitor {
+    mic: TrackState,
+    computer: TrackState,
+    mic_receiver: Receiver<Packet>,
+    computer_receiver: Receiver<Packet>,
+    workers: Vec<(Sender<()>, JoinHandle<()>)>,
+}
+
+impl Monitor {
+    pub fn start(mic_choice: DeviceChoice, output_choice: DeviceChoice) -> Result<Self, String> {
+        let started = Instant::now();
+        let (errors, _) = mpsc::channel();
+        let (mic, mic_receiver, mic_worker) =
+            start_monitor_track(Side::Mic, started, errors.clone(), mic_choice)?;
+        let (computer, computer_receiver, computer_worker) =
+            match start_monitor_track(Side::Computer, started, errors, output_choice) {
+                Ok(track) => track,
+                Err(error) => {
+                    stop_monitor_worker(mic_worker);
+                    return Err(error);
+                }
+            };
+        Ok(Self {
+            mic,
+            computer,
+            mic_receiver,
+            computer_receiver,
+            workers: vec![mic_worker, computer_worker],
+        })
+    }
+
+    pub fn levels(&self) -> (f32, f32) {
+        while self.mic_receiver.try_recv().is_ok() {}
+        while self.computer_receiver.try_recv().is_ok() {}
+        let take =
+            |peak: &AtomicU32| f32::from_bits(peak.swap(0, Ordering::Relaxed)).clamp(0.0, 1.0);
+        (take(&self.mic.peak), take(&self.computer.peak))
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        for worker in self.workers.drain(..) {
+            stop_monitor_worker(worker);
+        }
+    }
+}
+
+fn stop_monitor_worker(worker: (Sender<()>, JoinHandle<()>)) {
+    drop(worker.0);
+    let _ = worker.1.join();
+}
+
+fn start_monitor_track(
+    side: Side,
+    started: Instant,
+    errors: Sender<String>,
+    choice: DeviceChoice,
+) -> Result<(TrackState, Receiver<Packet>, (Sender<()>, JoinHandle<()>)), String> {
+    let (_, config, _, _) = resolve_device(side, &choice)?;
+    let rate = config.sample_rate();
+    let (sender, receiver) = mpsc::sync_channel(QUEUE_PACKETS);
+    let state = TrackState {
+        side,
+        rate,
+        started,
+        sender,
+        peak: Arc::new(AtomicU32::new(0)),
+        dropped_packets: Arc::new(AtomicU64::new(0)),
+        xruns: Arc::new(AtomicU64::new(0)),
+        reopen: Arc::new(AtomicBool::new(false)),
+        devices: Arc::new(Mutex::new(Vec::new())),
+        errors,
+    };
+    let (quit, quit_receiver) = mpsc::channel();
+    let (ready, ready_receiver) = mpsc::channel();
+    let supervisor_state = state.clone();
+    let supervisor = thread::Builder::new()
+        .name(format!("monitor-{}", side.label()))
+        .spawn(move || {
+            supervise(
+                supervisor_state,
+                choice,
+                Arc::new(AtomicBool::new(false)),
+                ready,
+                quit_receiver,
+            )
+        })
+        .map_err(|e| format!("could not start the monitor thread: {e}"))?;
+    match ready_receiver.recv() {
+        Ok(Ok(())) => Ok((state, receiver, (quit, supervisor))),
+        Ok(Err(error)) => {
+            drop(quit);
+            let _ = supervisor.join();
+            Err(error)
+        }
+        Err(_) => {
+            drop(quit);
+            let _ = supervisor.join();
+            Err(format!("{}: the monitor thread stopped", side.label()))
+        }
+    }
+}
+
 impl Recorder {
     /// Starts recording into the folder (created when missing).
-    pub fn start(dir: &Path) -> Result<Recorder, String> {
+    pub fn start(
+        dir: &Path,
+        mic_choice: DeviceChoice,
+        output_choice: DeviceChoice,
+    ) -> Result<Recorder, String> {
         if [Side::Mic, Side::Computer]
             .iter()
             .any(|side| dir.join(side.file_name()).exists())
@@ -187,13 +297,21 @@ impl Recorder {
         let (error_sender, error_receiver) = mpsc::channel();
         let fatal = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        let mic = start_track(Side::Mic, dir, started, Arc::clone(&fatal), error_sender.clone())?;
+        let mic = start_track(
+            Side::Mic,
+            dir,
+            started,
+            Arc::clone(&fatal),
+            error_sender.clone(),
+            mic_choice,
+        )?;
         let computer = match start_track(
             Side::Computer,
             dir,
             started,
             Arc::clone(&fatal),
             error_sender,
+            output_choice,
         ) {
             Ok(track) => track,
             Err(e) => {
@@ -273,7 +391,11 @@ impl Recorder {
         self.poll_errors();
         let mut errors = std::mem::take(&mut self.errors);
         let mic = self.mic.finish(stopped).map_err(|e| errors.push(e)).ok();
-        let computer = self.computer.finish(stopped).map_err(|e| errors.push(e)).ok();
+        let computer = self
+            .computer
+            .finish(stopped)
+            .map_err(|e| errors.push(e))
+            .ok();
         while let Ok(error) = self.error_receiver.try_recv() {
             errors.push(error);
         }
@@ -314,7 +436,9 @@ fn default_device(side: Side) -> Result<(Device, SupportedStreamConfig, String),
             (device, config)
         }
         Side::Computer => {
-            let device = host.default_output_device().ok_or("no default output device")?;
+            let device = host
+                .default_output_device()
+                .ok_or("no default output device")?;
             let config = device
                 .default_output_config()
                 .map_err(|e| format!("could not read the output format: {e}"))?;
@@ -325,12 +449,66 @@ fn default_device(side: Side) -> Result<(Device, SupportedStreamConfig, String),
         .description()
         .map(|d| d.name().to_owned())
         .unwrap_or_else(|_| side.label().to_owned());
-    let key = format!("{:?}|{name}", device.id().ok());
+    let key = format!("{}|{name}", device.id().map_err(|e| e.to_string())?);
     Ok((device, config, key))
+}
+
+fn resolve_device(
+    side: Side,
+    choice: &DeviceChoice,
+) -> Result<(Device, SupportedStreamConfig, String, bool), String> {
+    let pinned = if let DeviceChoice::Pinned(id) = choice {
+        devices::find(id).and_then(|device| {
+            let config = match side {
+                Side::Mic => device.default_input_config(),
+                Side::Computer => device.default_output_config(),
+            }
+            .ok()?;
+            let name = device
+                .description()
+                .map(|d| d.name().to_owned())
+                .unwrap_or_else(|_| device.to_string());
+            let key = format!("{}|{name}", device.id().ok()?);
+            Some((device, config, key))
+        })
+    } else {
+        None
+    };
+    let pinned_available = pinned.is_some();
+    let default = default_device(side).ok();
+    devices::choose_pinned(choice, pinned, default, pinned_available)
+        .map(|((device, config, key), pinned)| (device, config, key, pinned))
+        .ok_or_else(|| format!("no usable {} device", side.label()))
+}
+
+fn open_choice(
+    state: &TrackState,
+    choice: &DeviceChoice,
+) -> Result<(String, Stream, bool), String> {
+    let (device, config, key, pinned) = resolve_device(state.side, choice)?;
+    match open(state, &device, config) {
+        Ok(stream) => Ok((key, stream, pinned)),
+        Err(pinned_error) if pinned => {
+            let (default, config, key) = default_device(state.side)?;
+            open(state, &default, config)
+                .map(|stream| (key, stream, false))
+                .map_err(|default_error| {
+                    format!("{pinned_error}; Windows default also failed: {default_error}")
+                })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn device_name(key: &str) -> &str {
     key.split_once('|').map_or(key, |(_, name)| name)
+}
+
+fn device_label(side: Side) -> &'static str {
+    match side {
+        Side::Mic => "Microphone",
+        Side::Computer => "Output",
+    }
 }
 
 fn start_track(
@@ -339,8 +517,9 @@ fn start_track(
     started: Instant,
     fatal: Arc<AtomicBool>,
     errors: Sender<String>,
+    choice: DeviceChoice,
 ) -> Result<Track, String> {
-    let (device, config, key) = default_device(side)?;
+    let (_, config, _, _) = resolve_device(side, &choice)?;
     let rate = config.sample_rate();
     let (sender, receiver) = mpsc::sync_channel(QUEUE_PACKETS);
     let stop_at_us = Arc::new(AtomicU64::new(u64::MAX));
@@ -367,7 +546,7 @@ fn start_track(
     let supervised = state.clone();
     let supervisor = thread::Builder::new()
         .name(format!("capture-{}", side.label()))
-        .spawn(move || supervise(supervised, device, config, key, fatal, ready, quit_receiver))
+        .spawn(move || supervise(supervised, choice, fatal, ready, quit_receiver))
         .map_err(|e| format!("could not start the capture thread: {e}"))?;
     let track = Track {
         state,
@@ -391,16 +570,18 @@ fn start_track(
 /// stream fails.
 fn supervise(
     state: TrackState,
-    device: Device,
-    config: SupportedStreamConfig,
-    key: String,
+    choice: DeviceChoice,
     fatal: Arc<AtomicBool>,
     ready: Sender<Result<(), String>>,
     quit: Receiver<()>,
 ) {
+    crate::audio_thread_init();
     let label = state.side.label();
-    let mut current = match open(&state, &device, config) {
-        Ok(stream) => {
+    let mut pinned;
+    let mut current = match open_choice(&state, &choice) {
+        Ok((resolved_key, stream, resolved_pinned)) => {
+            pinned = resolved_pinned;
+            let key = resolved_key;
             push_device(&state, &key);
             let _ = ready.send(Ok(()));
             Some((key, stream))
@@ -410,6 +591,18 @@ fn supervise(
             return;
         }
     };
+    if let DeviceChoice::Pinned(id) = &choice {
+        if !pinned {
+            let name = devices::find(id)
+                .and_then(|d| d.description().ok().map(|d| d.name().to_owned()))
+                .unwrap_or_else(|| id.clone());
+            let _ = state.errors.send(format!(
+                "{} {name} not available, recording Windows default {}",
+                device_label(state.side),
+                device_name(current.as_ref().map_or("", |(key, _)| key))
+            ));
+        }
+    }
     let mut failing_since: Option<Instant> = None;
     loop {
         match quit.recv_timeout(WATCH_INTERVAL) {
@@ -417,25 +610,48 @@ fn supervise(
             _ => break,
         }
         let reopen = state.reopen.swap(false, Ordering::Relaxed);
-        let wanted = default_device(state.side);
+        let wanted = resolve_device(state.side, &choice);
         let changed = match (&wanted, &current) {
-            (Ok((_, _, key)), Some((current_key, _))) => key != current_key,
+            (Ok((_, _, key, _)), Some((current_key, _))) => key != current_key,
             (Ok(_), None) => true,
             (Err(_), _) => false,
         };
         if !reopen && !changed {
             continue;
         }
+        let previous_key = current
+            .as_ref()
+            .map(|(key, _)| key.clone())
+            .unwrap_or_default();
         drop(current.take());
-        match wanted.and_then(|(device, config, key)| {
-            open(&state, &device, config).map(|stream| (key, stream))
-        }) {
-            Ok((key, stream)) => {
-                let _ = state
-                    .errors
-                    .send(format!("{label}: now recording {}", device_name(&key)));
+        match wanted.and_then(|_| open_choice(&state, &choice)) {
+            Ok((key, stream, wanted_pinned)) => {
+                if key != previous_key {
+                    if let DeviceChoice::Pinned(id) = &choice {
+                        if wanted_pinned {
+                            let _ = state.errors.send(format!(
+                                "{label}: pinned device {} is available again",
+                                device_name(&key)
+                            ));
+                        } else if pinned {
+                            let name = devices::find(id)
+                                .and_then(|d| d.description().ok().map(|d| d.name().to_owned()))
+                                .unwrap_or_else(|| id.clone());
+                            let _ = state.errors.send(format!(
+                                "{} {name} not available, recording Windows default {}",
+                                device_label(state.side),
+                                device_name(&key)
+                            ));
+                        }
+                    } else {
+                        let _ = state
+                            .errors
+                            .send(format!("{label}: now recording {}", device_name(&key)));
+                    }
+                }
                 push_device(&state, &key);
                 current = Some((key, stream));
+                pinned = wanted_pinned;
                 failing_since = None;
             }
             Err(e) => {
@@ -527,7 +743,14 @@ fn spawn_encoder(path: &Path, rate: u32) -> Result<Child, String> {
     crate::ffmpeg::command()
         .args(["-y", "-f", "s16le", "-ar", &rate.to_string(), "-ac", "1"])
         .args(["-i", "pipe:0", "-map_metadata", "-1", "-c:a", "libopus"])
-        .args(["-b:a", &BITRATE_BPS.to_string(), "-vbr", "on", "-application", "voip"])
+        .args([
+            "-b:a",
+            &BITRATE_BPS.to_string(),
+            "-vbr",
+            "on",
+            "-application",
+            "voip",
+        ])
         .args(["-f", "ogg"])
         .arg(path)
         .stdin(Stdio::piped())
@@ -573,7 +796,10 @@ fn finish_encoder(
         return Err(error);
     }
     if !status.success() {
-        return Err(format!("FFmpeg failed to encode {} ({status})", path.display()));
+        return Err(format!(
+            "FFmpeg failed to encode {} ({status})",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -660,7 +886,11 @@ where
         .map_err(|e| format!("could not open the {} stream: {e}", state.side.label()))
 }
 
-fn open(state: &TrackState, device: &Device, config: SupportedStreamConfig) -> Result<Stream, String> {
+fn open(
+    state: &TrackState,
+    device: &Device,
+    config: SupportedStreamConfig,
+) -> Result<Stream, String> {
     let stream = match config.sample_format() {
         SampleFormat::F32 => build_stream::<f32>(state, device, config),
         SampleFormat::F64 => build_stream::<f64>(state, device, config),

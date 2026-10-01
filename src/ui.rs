@@ -19,6 +19,21 @@ use crate::player::Player;
 use crate::types::{Abort, Event, Meeting, Side};
 
 pub fn run() -> Result<(), String> {
+    // CPAL caches one process-wide enumerator. Its first creation must happen in
+    // a live MTA apartment, before winit (or a device chooser) can initialize it.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (audio_quit, quit_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        crate::audio_thread_init();
+        let _ = cpal::default_host()
+            .default_output_device()
+            .map(|d| d.default_output_config());
+        let _ = ready_tx.send(());
+        let _ = quit_rx.recv();
+    });
+    ready_rx.recv().map_err(|e| e.to_string())?;
+    let _audio_apartment = audio_quit;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Meeting Recorder")
@@ -50,6 +65,7 @@ struct Job {
     progress: f64,
     log: VecDeque<String>,
     close_when_done: bool,
+    finalizing: bool,
 }
 
 struct App {
@@ -57,6 +73,14 @@ struct App {
     entries: Vec<Entry>,
     screen: Screen,
     recorder: Option<Recorder>,
+    starting: Option<Receiver<Result<Recorder, String>>>,
+    recovery: Option<Receiver<()>>,
+    allow_close: bool,
+    close_after_start: bool,
+    folder_picker: Option<Receiver<Option<PathBuf>>>,
+    test_seconds: Option<u64>,
+    test_started: bool,
+    settings_auto_transcribe: bool,
     recording_meters: [f32; 2],
     recording_elapsed: Duration,
     recording_errors: Vec<String>,
@@ -70,8 +94,6 @@ struct App {
     notice: Option<String>,
     settings_key: String,
     settings_show_key: bool,
-    settings_language: String,
-    settings_custom_language: String,
     settings_name: String,
     settings_meetings_dir: String,
     settings_diarize: bool,
@@ -88,19 +110,37 @@ impl App {
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(43, 49, 59);
         visuals.selection.bg_fill = Color32::from_rgb(45, 105, 112);
         cc.egui_ctx.set_visuals(visuals);
-        let config = Config::load();
+        let mut config = Config::load();
+        if let Ok(dir) = std::env::var("MR_GUI_TEST_DIR") {
+            config.meetings_dir = Some(PathBuf::from(dir));
+            config.auto_transcribe = Some(false);
+        }
+        let (recovered_tx, recovered_rx) = mpsc::channel();
+        let recovery_root = config.meetings_dir();
+        thread::spawn(move || {
+            meetings::recover(&recovery_root);
+            let _ = recovered_tx.send(());
+        });
         let mut app = Self {
             entries: meetings::list(&config.meetings_dir()),
             settings_key: config.elevenlabs_api_key.clone().unwrap_or_default(),
             settings_show_key: false,
-            settings_language: language_choice(config.language.as_deref()),
-            settings_custom_language: config.language.clone().unwrap_or_default(),
             settings_name: config.your_name.clone().unwrap_or_default(),
             settings_meetings_dir: config.meetings_dir().display().to_string(),
             settings_diarize: config.diarize(),
-            config,
+            config: config.clone(),
             screen: Screen::Recording,
             recorder: None,
+            starting: None,
+            recovery: Some(recovered_rx),
+            allow_close: false,
+            close_after_start: false,
+            folder_picker: None,
+            test_seconds: std::env::var("MR_GUI_RECORD_TEST_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            test_started: false,
+            settings_auto_transcribe: config.auto_transcribe(),
             recording_meters: [0.0; 2],
             recording_elapsed: Duration::ZERO,
             recording_errors: Vec::new(),
@@ -128,22 +168,34 @@ impl App {
     }
 
     fn start_recording(&mut self) {
-        if self.recorder.is_some() || self.job.is_some() {
+        if self.recorder.is_some() || self.job.is_some() || self.starting.is_some() {
             return;
         }
         let root = self.config.meetings_dir();
+        let mic_choice = crate::devices::DeviceChoice::from(self.config.mic_device());
+        let output_choice = crate::devices::DeviceChoice::from(self.config.output_device());
         let dir = meetings::new_dir(&root, crate::capture::unix_ms());
-        match Recorder::start(&dir) {
-            Ok(recorder) => {
-                self.recording_elapsed = Duration::ZERO;
-                self.recording_errors.clear();
-                self.recording_meters = [0.0; 2];
-                self.screen = Screen::Recording;
-                self.notice = None;
-                self.recorder = Some(recorder);
+        self.notice = None;
+        self.screen = Screen::Recording;
+        let (tx, rx) = mpsc::channel();
+        self.starting = Some(rx);
+        thread::spawn(move || {
+            crate::audio_thread_init();
+            crate::log_event(&format!("Starting recording: {}", dir.display()));
+            let result = Recorder::start(&dir, mic_choice, output_choice);
+            if result.is_ok() {
+                let _ = std::fs::write(dir.join(".recorder-pid"), std::process::id().to_string());
+            } else {
+                meetings::cleanup_failed_start(&dir);
             }
-            Err(error) => self.notice = Some(error),
-        }
+            if let Err(error) = &result {
+                crate::log_event(&format!("Recording start failed: {error}"));
+            }
+            // If the GUI disappeared while starting, still finalize the recording.
+            if let Err(mpsc::SendError(Ok(recorder))) = tx.send(result) {
+                let _ = recorder.stop();
+            }
+        });
     }
 
     fn stop_recording(&mut self, close_when_done: bool) {
@@ -153,10 +205,16 @@ impl App {
         self.recording_elapsed = recorder.elapsed();
         let dir = recorder.dir().to_path_buf();
         let config = self.config.clone();
-        let stop_only = close_when_done;
-        self.start_job(dir.clone(), close_when_done, move |events, abort| {
+        let stop_only = close_when_done || !config.auto_transcribe();
+        self.start_job(dir.clone(), close_when_done, true, move |events, abort| {
             let _ = events.send(Event::Stage("Finalizing recording".into()));
             let session = recorder.stop()?;
+            let _ = std::fs::remove_file(dir.join(".recorder-pid"));
+            crate::log_event(&format!(
+                "Recording finalized: {} ({})",
+                dir.display(),
+                session.status
+            ));
             let duration = session
                 .mic
                 .as_ref()
@@ -192,7 +250,7 @@ impl App {
     }
 
     fn start_transcription(&mut self, dir: PathBuf) {
-        if self.job.is_some() {
+        if self.job.is_some() || self.recorder.is_some() || self.starting.is_some() {
             return;
         }
         if self.config.api_key().is_none() {
@@ -202,13 +260,13 @@ impl App {
         }
         let config = self.config.clone();
         self.notice = None;
-        self.start_job(dir.clone(), false, move |events, abort| {
+        self.start_job(dir.clone(), false, false, move |events, abort| {
             let options = pipeline::Options::from_config(&config)?;
             pipeline::process(&dir, &options, &events, abort)
         });
     }
 
-    fn start_job<F>(&mut self, dir: PathBuf, close_when_done: bool, work: F)
+    fn start_job<F>(&mut self, dir: PathBuf, close_when_done: bool, finalizing: bool, work: F)
     where
         F: FnOnce(crate::types::Events, &Abort) -> Result<Meeting, String> + Send + 'static,
     {
@@ -219,7 +277,15 @@ impl App {
         let _ = thread::Builder::new()
             .name("meeting-recorder-job".into())
             .spawn(move || {
-                let result = work(event_tx, &worker_abort);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    work(event_tx, &worker_abort)
+                }))
+                .unwrap_or_else(|_| {
+                    Err("The background task panicked. See the application log.".into())
+                });
+                if let Err(error) = &result {
+                    crate::log_event(&format!("Job failed: {error}"));
+                }
                 let _ = done_tx.send(result);
             });
         self.job = Some(Job {
@@ -231,10 +297,61 @@ impl App {
             progress: 0.0,
             log: VecDeque::new(),
             close_when_done,
+            finalizing,
         });
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|rx| !matches!(rx.try_recv(), Err(TryRecvError::Empty)))
+        {
+            self.recovery = None;
+            self.refresh_meetings();
+        }
+        let startup = self.starting.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Disconnected) => {
+                Some(Err("Recording startup stopped unexpectedly".into()))
+            }
+            Err(TryRecvError::Empty) => None,
+        });
+        if let Some(result) = startup {
+            self.starting = None;
+            match result {
+                Ok(recorder) => {
+                    self.recording_elapsed = Duration::ZERO;
+                    self.recording_errors.clear();
+                    self.recording_meters = [0.0; 2];
+                    self.recorder = Some(recorder);
+                    if self.close_after_start {
+                        self.close_after_start = false;
+                        self.stop_recording(true);
+                    }
+                }
+                Err(error) => {
+                    self.recording_errors = vec![format!("Could not start recording: {error}")];
+                    self.notice = Some(error);
+                    if self.close_after_start {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.folder_picker {
+            match rx.try_recv() {
+                Ok(path) => {
+                    if let Some(path) = path {
+                        self.settings_meetings_dir = path.display().to_string();
+                    }
+                    self.folder_picker = None;
+                }
+                Err(TryRecvError::Disconnected) => self.folder_picker = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         let mut fatal = false;
         if let Some(recorder) = &mut self.recorder {
             self.recording_elapsed = recorder.elapsed();
@@ -258,11 +375,14 @@ impl App {
             while let Ok(event) = job.events.try_recv() {
                 match event {
                     Event::Stage(stage) => {
+                        crate::log_event(&stage);
+                        job.finalizing = stage == "Finalizing recording";
                         job.stage = stage;
                         job.progress = 0.0;
                     }
                     Event::Progress(progress) => job.progress = progress.clamp(0.0, 1.0),
                     Event::Log(line) => {
+                        crate::log_event(&line);
                         job.log.push_back(line);
                         while job.log.len() > 60 {
                             job.log.pop_front();
@@ -282,10 +402,10 @@ impl App {
             let Some(job) = self.job.take() else { return };
             self.refresh_meetings();
             self.meeting_cache = None;
+            self.select_meeting(job.dir.clone());
             match result {
                 Ok(_) => {
                     self.notice = None;
-                    self.select_meeting(job.dir.clone());
                 }
                 Err(error) => {
                     if error.starts_with("no ElevenLabs API key") {
@@ -296,10 +416,10 @@ impl App {
                     } else {
                         self.notice = Some(error);
                     }
-                    self.select_meeting(job.dir.clone());
                 }
             }
             if job.close_when_done {
+                self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -326,7 +446,8 @@ impl App {
                     }
                 });
                 ui.add_space(14.0);
-                let can_record = self.recorder.is_none() && self.job.is_none();
+                let can_record =
+                    self.recorder.is_none() && self.job.is_none() && self.starting.is_none();
                 if ui
                     .add_enabled(
                         can_record,
@@ -361,10 +482,18 @@ impl App {
                             let date =
                                 meetings::local_time(entry.started_at_unix_ms, "%b %d, %Y  %H:%M");
                             let label = format!(
-                                "{mark}{}\n{}  ·  {}",
+                                "{mark}{}\n{}  ·  {}  {}",
                                 entry.title,
                                 date,
-                                format_duration(entry.duration_ms)
+                                format_duration(entry.duration_ms),
+                                if matches!(
+                                    entry.status.as_str(),
+                                    "empty" | "interrupted" | "failed"
+                                ) {
+                                    entry.status.as_str()
+                                } else {
+                                    ""
+                                }
                             );
                             let button = egui::Button::new(RichText::new(label).size(12.5))
                                 .min_size(Vec2::new(ui.available_width(), 61.0));
@@ -426,11 +555,10 @@ impl App {
 
     fn load_settings_draft(&mut self) {
         self.settings_key = self.config.elevenlabs_api_key.clone().unwrap_or_default();
-        self.settings_language = language_choice(self.config.language.as_deref());
-        self.settings_custom_language = self.config.language.clone().unwrap_or_default();
         self.settings_name = self.config.your_name.clone().unwrap_or_default();
         self.settings_meetings_dir = self.config.meetings_dir().display().to_string();
         self.settings_diarize = self.config.diarize();
+        self.settings_auto_transcribe = self.config.auto_transcribe();
         self.settings_message = None;
     }
 
@@ -445,9 +573,11 @@ impl App {
         ui.add_space(34.0);
         let active = self.recorder.is_some();
         ui.vertical_centered(|ui| {
-            let finalizing = self.job.is_some();
+            let finalizing = self.job.is_some() || self.starting.is_some();
             let label = if active {
                 "Stop recording"
+            } else if self.starting.is_some() {
+                "Starting…"
             } else if finalizing {
                 "Finalizing…"
             } else {
@@ -669,7 +799,14 @@ impl App {
                                 .color(Color32::GRAY),
                         );
                         ui.add_space(12.0);
-                        if ui.button("Transcribe").clicked() {
+                        if ui
+                            .add_enabled(
+                                self.job.is_none(),
+                                egui::Button::new(RichText::new("Transcribe").size(20.0).strong())
+                                    .min_size(Vec2::new(210.0, 48.0)),
+                            )
+                            .clicked()
+                        {
                             self.start_transcription(dir.clone());
                         }
                     });
@@ -738,7 +875,11 @@ impl App {
         if title_dirty {
             self.meeting_dirty = true;
         }
-        if self.meeting_dirty && (title_commit || editor_lost_focus || editor_enter) {
+        if self.meeting_dirty
+            && self.job.is_none()
+            && self.recorder.is_none()
+            && (title_commit || editor_lost_focus || editor_enter)
+        {
             match meetings::save(&dir, &meeting) {
                 Ok(()) => {
                     let new_dir = if meeting.title.trim() != self.saved_title.trim() {
@@ -812,21 +953,12 @@ impl App {
             });
             ui.add_space(19.0);
 
-            ui.label(RichText::new("Transcription language").strong());
-            egui::ComboBox::from_id_salt("language-choice")
-                .selected_text(language_label(&self.settings_language))
-                .show_ui(ui, |ui| {
-                    for (code, label) in language_options() {
-                        ui.selectable_value(&mut self.settings_language, code.to_owned(), label);
-                    }
-                });
-            if self.settings_language == "custom" {
-                ui.add_sized(
-                    [240.0, 30.0],
-                    egui::TextEdit::singleline(&mut self.settings_custom_language)
-                        .hint_text("Language code, e.g. pt"),
-                );
-            }
+            ui.label(RichText::new("Transcription language: Automatic").strong());
+            ui.label("ElevenLabs detects the spoken language.");
+            ui.checkbox(
+                &mut self.settings_auto_transcribe,
+                "Transcribe automatically after recording",
+            );
             ui.add_space(19.0);
 
             ui.label(RichText::new("Your name").strong());
@@ -844,9 +976,14 @@ impl App {
                     egui::TextEdit::singleline(&mut self.settings_meetings_dir),
                 );
                 if ui.button("Browse…").clicked() {
-                    let dialog = rfd::FileDialog::new().set_directory(&self.settings_meetings_dir);
-                    if let Some(path) = dialog.pick_folder() {
-                        self.settings_meetings_dir = path.display().to_string();
+                    if self.folder_picker.is_none() {
+                        let folder = self.settings_meetings_dir.clone();
+                        let (tx, rx) = mpsc::channel();
+                        self.folder_picker = Some(rx);
+                        thread::spawn(move || {
+                            let _ =
+                                tx.send(rfd::FileDialog::new().set_directory(folder).pick_folder());
+                        });
                     }
                 }
             });
@@ -880,11 +1017,8 @@ impl App {
 
     fn save_settings(&mut self) {
         self.config.elevenlabs_api_key = nonempty(&self.settings_key);
-        self.config.language = match self.settings_language.as_str() {
-            "auto" => None,
-            "custom" => nonempty(&self.settings_custom_language),
-            code => Some(code.to_owned()),
-        };
+        self.config.language = None;
+        self.config.auto_transcribe = Some(self.settings_auto_transcribe);
         self.config.your_name = nonempty(&self.settings_name);
         let folder = self.settings_meetings_dir.trim();
         self.config.meetings_dir = if folder.is_empty() {
@@ -907,7 +1041,10 @@ impl App {
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&job.stage).strong());
-                if ui.small_button("Cancel").clicked() {
+                if ui
+                    .add_enabled(!job.finalizing, egui::Button::new("Cancel").small())
+                    .clicked()
+                {
                     job.abort.store(true, Ordering::Relaxed);
                     job.stage = "Cancelling…".into();
                 }
@@ -946,11 +1083,17 @@ impl App {
 
     fn show_close_dialog(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if self.allow_close {
+            return;
+        }
         if close_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.recorder.is_some() || self.job.is_some() {
+            if self.close_after_start || self.job.as_ref().is_some_and(|j| j.close_when_done) {
+                return;
+            } else if self.recorder.is_some() || self.job.is_some() || self.starting.is_some() {
                 self.close_dialog = true;
             } else {
+                self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -984,10 +1127,20 @@ impl App {
                 self.close_dialog = false;
                 if self.recorder.is_some() {
                     self.stop_recording(true);
+                } else if self.starting.is_some() {
+                    self.close_after_start = true;
                 } else if let Some(job) = &mut self.job {
                     job.abort.store(true, Ordering::Relaxed);
-                    job.close_when_done = true;
+                    if job.finalizing {
+                        job.close_when_done = true;
+                    } else {
+                        // HTTP cancellation is cooperative and may await a two-hour request.
+                        // Audio is already saved; detached transcription must not hold the window.
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 } else {
+                    self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -1002,13 +1155,32 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.show_close_dialog(&ctx);
         self.poll_background(&ctx);
+        if let Some(seconds) = self.test_seconds {
+            if !self.test_started {
+                self.test_started = true;
+                self.start_recording();
+            } else if self
+                .recorder
+                .as_ref()
+                .is_some_and(|r| r.elapsed().as_secs() >= seconds)
+            {
+                self.stop_recording(true);
+            } else if self.starting.is_none() && self.recorder.is_none() && self.job.is_none() {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
         self.show_sidebar(ui);
         egui::CentralPanel::default().show(ui, |ui| match self.screen.clone() {
             Screen::Recording => self.show_recording(ui),
             Screen::Meeting(dir) => self.show_meeting(ui, &ctx, dir),
             Screen::Settings => self.show_settings(ui),
         });
-        if self.recorder.is_some()
+        if self.folder_picker.is_some()
+            || self.starting.is_some()
+            || self.recovery.is_some()
+            || self.test_seconds.is_some()
+            || self.recorder.is_some()
             || self.job.is_some()
             || self
                 .player
@@ -1081,39 +1253,4 @@ fn speaker_color(id: &str, side: Side) -> Color32 {
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
-}
-
-fn language_options() -> [(&'static str, &'static str); 8] {
-    [
-        ("auto", "Automatic"),
-        ("en", "English"),
-        ("it", "Italiano"),
-        ("nl", "Nederlands"),
-        ("de", "Deutsch"),
-        ("fr", "Français"),
-        ("es", "Español"),
-        ("custom", "Custom code"),
-    ]
-}
-
-fn language_choice(language: Option<&str>) -> String {
-    let value = language.unwrap_or("auto");
-    if language_options()
-        .iter()
-        .any(|(code, _)| *code == value && value != "custom")
-    {
-        value.to_owned()
-    } else if language.is_some() {
-        "custom".to_owned()
-    } else {
-        "auto".to_owned()
-    }
-}
-
-fn language_label(code: &str) -> &'static str {
-    language_options()
-        .iter()
-        .find(|(candidate, _)| *candidate == code)
-        .map(|(_, label)| *label)
-        .unwrap_or("Automatic")
 }
