@@ -295,6 +295,16 @@ impl App {
         self.notice = None;
     }
 
+    /// Opens the recording screen in a ready state. Capture only begins when
+    /// the user presses Record; meanwhile the idle monitor shows live levels.
+    fn arm_recording(&mut self) {
+        if self.recorder.is_none() {
+            self.notice = None;
+            self.recording_errors.clear();
+        }
+        self.screen = Screen::Recording;
+    }
+
     fn start_recording(&mut self) {
         if self.recorder.is_some() || self.job.is_some() || self.starting.is_some() {
             return;
@@ -576,12 +586,16 @@ impl App {
                     }
                 });
                 ui.add_space(14.0);
-                let can_record =
-                    self.recorder.is_none() && self.job.is_none() && self.starting.is_none();
+                let can_open = self.job.is_none() && self.starting.is_none();
+                let label = if self.recorder.is_some() {
+                    "Show recording"
+                } else {
+                    "New recording"
+                };
                 if ui
                     .add_enabled(
-                        can_record,
-                        egui::Button::new(RichText::new("New recording").strong())
+                        can_open,
+                        egui::Button::new(RichText::new(label).strong())
                             .min_size(Vec2::new(ui.available_width(), 42.0)),
                     )
                     .clicked()
@@ -672,7 +686,7 @@ impl App {
             self.refresh_meetings();
         }
         if new_recording {
-            self.start_recording();
+            self.arm_recording();
         }
         if let Some(dir) = picked {
             self.select_meeting(dir);
@@ -694,10 +708,24 @@ impl App {
 
     fn show_recording(&mut self, ui: &mut egui::Ui) {
         ui.add_space(26.0);
-        ui.heading("Recording");
+        ui.heading("New recording");
         ui.add_space(6.0);
+        let (status, color) = if self.recorder.is_some() {
+            ("●  RECORDING", Color32::from_rgb(235, 105, 95))
+        } else if self.starting.is_some() {
+            ("◌  Starting…", Color32::from_rgb(230, 190, 110))
+        } else if self.job.is_some() {
+            ("◌  Saving…", Color32::from_rgb(130, 194, 187))
+        } else {
+            (
+                "Ready, not recording. Check the levels, then press Record.",
+                Color32::from_rgb(150, 200, 160),
+            )
+        };
+        ui.label(RichText::new(status).strong().size(15.0).color(color));
+        ui.add_space(4.0);
         ui.label(
-            RichText::new("Microphone and computer audio are saved as separate tracks.")
+            RichText::new("Your microphone and the computer's audio are saved as separate tracks.")
                 .color(Color32::GRAY),
         );
         ui.add_space(22.0);
@@ -744,10 +772,15 @@ impl App {
                 }
             }
             ui.add_space(18.0);
-            ui.label(
-                RichText::new(format_duration(self.recording_elapsed.as_millis() as i64))
-                    .monospace()
-                    .size(31.0),
+            // Fixed-size cell so the timer never nudges the layout as digits change.
+            ui.add_sized(
+                [230.0, 40.0],
+                egui::Label::new(
+                    RichText::new(format_duration(self.recording_elapsed.as_millis() as i64))
+                        .monospace()
+                        .size(31.0),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
         ui.add_space(34.0);
@@ -810,9 +843,9 @@ impl App {
             ),
         };
         let title = if index == 0 {
-            "Microphone"
+            "Microphone (you)"
         } else {
-            "Output / loopback"
+            "System audio (them)"
         };
         let id_salt = if index == 0 {
             "mic-device-picker"
@@ -870,9 +903,10 @@ impl App {
         } else {
             self.idle_meters[index]
         };
+        let listening = self.recorder.is_some() || self.monitor_stop.is_some();
         ui.horizontal(|ui| {
             ui.add_space(118.0);
-            meter(ui, level);
+            meter(ui, level, listening, index == 1);
         });
         let is_open = response.inner.is_some();
         self.device_popups_open[index] = is_open;
@@ -1470,24 +1504,61 @@ impl eframe::App for App {
     }
 }
 
-fn meter(ui: &mut egui::Ui, value: f32) {
+/// Level meter on a dBFS scale (-60..0), so ordinary speech around -30 dBFS
+/// fills half the bar instead of a few percent, plus a plain-language status.
+fn meter(ui: &mut egui::Ui, value: f32, listening: bool, system_audio: bool) {
     let value = value.clamp(0.0, 1.0);
     let dbfs = if value > 0.0 {
         20.0 * value.log10()
     } else {
         f32::NEG_INFINITY
     };
+    let has_signal = listening && dbfs.is_finite() && dbfs > -60.0;
+    let fraction = if has_signal {
+        ((dbfs + 60.0) / 60.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     ui.horizontal(|ui| {
-        ui.add(
-            egui::ProgressBar::new(value)
-                .desired_width((ui.available_width() - 90.0).clamp(80.0, 330.0))
-                .text(format!("{:>3.0}%", value * 100.0)),
-        );
-        ui.label(if dbfs.is_finite() && dbfs > -90.0 {
-            format!("{dbfs:.1} dBFS")
+        let width = (ui.available_width() - 100.0).clamp(120.0, 380.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, Color32::from_gray(38));
+        if fraction > 0.0 {
+            let mut fill = rect;
+            fill.set_width(rect.width() * fraction);
+            let color = if dbfs > -3.0 {
+                Color32::from_rgb(220, 80, 70)
+            } else if dbfs > -12.0 {
+                Color32::from_rgb(225, 180, 70)
+            } else {
+                Color32::from_rgb(80, 190, 120)
+            };
+            ui.painter().rect_filled(fill, 3.0, color);
+        }
+        // Tick marks every 12 dB help judge loudness at a glance.
+        for db in [-48.0_f32, -36.0, -24.0, -12.0] {
+            let x = rect.left() + rect.width() * (db + 60.0) / 60.0;
+            ui.painter().line_segment(
+                [egui::pos2(x, rect.bottom() - 4.0), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, Color32::from_gray(90)),
+            );
+        }
+        let (text, color) = if !listening {
+            ("not listening".to_owned(), Color32::GRAY)
+        } else if has_signal {
+            (format!("{dbfs:>4.0} dBFS"), Color32::LIGHT_GRAY)
+        } else if system_audio {
+            ("silence".to_owned(), Color32::GRAY)
         } else {
-            "silence".into()
-        });
+            ("silence".to_owned(), Color32::from_rgb(230, 160, 90))
+        };
+        // Fixed-size, non-wrapping status cell: changing text must not change
+        // the row height, or everything below (Stop button, timer) jumps.
+        ui.add_sized(
+            [90.0, 18.0],
+            egui::Label::new(RichText::new(text).color(color).monospace())
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        );
     });
 }
 
