@@ -12,7 +12,7 @@
     table at the end. The script exits 1 when any check FAILs.
 
     No ElevenLabs spend: the pipeline runs against the cached responses in
-    windows-recorder/testdata/stt/.
+    testdata/stt/.
 
 .PARAMETER SkipBuild
     Reuse the exe already in the target dir instead of running cargo build.
@@ -25,7 +25,7 @@
 .PARAMETER WorkRoot
     Where screenshots and temporary state are written. Default %TEMP%\mr-qa.
 .EXAMPLE
-    pwsh -File windows-recorder/scripts/qa/run-e2e.ps1
+    pwsh -File scripts/qa/run-e2e.ps1
 #>
 [CmdletBinding()]
 param(
@@ -164,10 +164,10 @@ function Set-TextNoBom {
 # --------------------------------------------------------------------------- #
 
 $crate = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$repo = (Resolve-Path (Join-Path $crate '..')).Path
-$fixtures = Join-Path $repo 'bench\fixtures'
+$repo = $crate
+$fixtures = Join-Path $repo 'testdata\fixtures'
 $sttCache = Join-Path $crate 'testdata\stt'
-$targetDir = Join-Path $env:TEMP 'mr-target-seeker'
+$targetDir = Join-Path $env:TEMP 'sottovoce-qa-target'
 $exe = Join-Path $targetDir 'release\meeting-recorder.exe'
 
 $screens = Join-Path $WorkRoot 'screens'

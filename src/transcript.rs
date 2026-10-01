@@ -1096,7 +1096,7 @@ mod tests {
 
         let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let stt_root = crate_root.join("testdata").join("stt");
-        let fixtures_root = crate_root.join("..").join("bench").join("fixtures");
+        let fixtures_root = crate_root.join("testdata").join("fixtures");
         let Ok(fixture_dirs) = std::fs::read_dir(&fixtures_root) else {
             return;
         };

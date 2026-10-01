@@ -2,8 +2,8 @@
 
 `run-e2e.ps1` is an end-to-end check of the Windows `meeting-recorder` crate.
 It builds the release binary in its own `CARGO_TARGET_DIR`
-(`%TEMP%\mr-target-seeker`), so it never touches a teammate's build or locks
-`windows-recorder/target`.
+(`%TEMP%\sottovoce-qa-target`), so it never touches a teammate's build or locks
+`target`.
 
 ## What it checks
 
@@ -14,7 +14,7 @@ It builds the release binary in its own `CARGO_TARGET_DIR`
 3. **Pipeline, offline** - for the `call`, `call-speakers` and `room` fixtures
    it builds a temporary meeting folder (`mic.ogg`, `computer.ogg`,
    `session.json` with `status = "completed"`) and copies the cached
-   ElevenLabs responses from `windows-recorder/testdata/stt/` to
+   ElevenLabs responses from `testdata/stt/` to
    `.stt-mic.json` / `.stt-computer.json`, which is where `pipeline.rs` looks.
    `meeting-recorder process` then runs with a dummy `ELEVENLABS_API_KEY`, so
    there is **no API spend**. `room` gets a computer track generated
@@ -47,7 +47,7 @@ run it while another process is editing that config.
 ## Usage
 
 ```powershell
-pwsh -File windows-recorder/scripts/qa/run-e2e.ps1
+pwsh -File scripts/qa/run-e2e.ps1
 ```
 
 Parameters: `-SkipBuild`, `-SkipSelftest`, `-SkipGui` (also implied on a

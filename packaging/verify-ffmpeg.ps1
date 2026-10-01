@@ -126,8 +126,8 @@ if ([string]::IsNullOrWhiteSpace($ReferenceFfmpeg)) {
 }
 $ReferenceFfmpeg = (Resolve-Path -LiteralPath $ReferenceFfmpeg).Path
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$fixtureRoot = Join-Path $repoRoot 'bench\fixtures'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$fixtureRoot = Join-Path $repoRoot 'testdata\fixtures'
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("meeting-recorder-ffmpeg-check-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 

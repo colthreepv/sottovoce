@@ -7,7 +7,7 @@ The Windows app records the microphone and Windows output loopback as separate O
 Open the GUI:
 
 ```powershell
-cargo run --release --manifest-path .\windows-recorder\Cargo.toml
+cargo run --release
 ```
 
 Useful command line commands include `devices`, `record [folder]`, `process <folder>`, `diarize <audio>`, `stt <audio>`, and `selftest`.
