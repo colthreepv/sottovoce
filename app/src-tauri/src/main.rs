@@ -96,6 +96,31 @@ fn update_config(config: Config, state: State<Engine>) -> Result<(), String> {
     lock_core(&state)?.update_config(config)
 }
 #[tauri::command]
+async fn test_api_key(key: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
+    let key = key
+        .or_else(|| app.state::<Engine>().core.get_config().api_key())
+        .ok_or("No API key configured")?;
+    // The blocking HTTP client enforces a ten second total request timeout.
+    tauri::async_runtime::spawn_blocking(move || sottovoce_engine::elevenlabs::verify_key(&key))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[derive(Serialize)]
+struct FolderDefaults {
+    meetings_dir: PathBuf,
+    transcripts_dir: PathBuf,
+    archive_dir: PathBuf,
+}
+#[tauri::command]
+fn get_folder_defaults() -> FolderDefaults {
+    let config = Config::default();
+    FolderDefaults {
+        meetings_dir: config.meetings_dir(),
+        transcripts_dir: config.transcripts_dir(),
+        archive_dir: config.archive_dir(),
+    }
+}
+#[tauri::command]
 fn get_snapshot(state: State<Engine>) -> Result<Snapshot, String> {
     let core = lock_core(&state)?;
     let mut snapshot = state
@@ -197,6 +222,7 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let (core, receiver) = Core::new()?;
             let snapshot = Snapshot {
@@ -268,6 +294,8 @@ fn main() {
             list_devices,
             get_config,
             update_config,
+            test_api_key,
+            get_folder_defaults,
             shutdown,
             get_snapshot,
             get_meeting

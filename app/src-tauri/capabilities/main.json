@@ -2,5 +2,5 @@
   "identifier": "main",
   "description": "Main window event subscriptions",
   "windows": ["main"],
-  "permissions": ["core:event:default"]
+  "permissions": ["core:event:default", "dialog:allow-open"]
 }

@@ -28,6 +28,9 @@ export type CoreEvent =
  | { type: 'config_changed'; config: Config }
  | { type: 'error'; message: string };
 export const api = {
+ getConfig: () => invoke<Config>('get_config'),
+ testKey: (key: string | null) => invoke<void>('test_api_key', {key}),
+ folderDefaults: () => invoke<Record<'meetings_dir' | 'transcripts_dir' | 'archive_dir', string>>('get_folder_defaults'),
  snapshot: () => invoke<Snapshot>('get_snapshot'), meetings: () => invoke<MeetingEntry[]>('list_meetings'),
  meeting: (meeting: string) => invoke<MeetingView>('get_meeting', { meeting }),
  start: () => invoke<void>('start_recording'), stop: () => invoke<void>('stop_recording'),

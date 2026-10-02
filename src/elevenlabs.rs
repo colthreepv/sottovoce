@@ -16,6 +16,50 @@ const ENDPOINT: &str = "https://api.elevenlabs.io/v1/speech-to-text";
 const MAX_ATTEMPTS: u32 = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// Probe authentication without uploading audio or creating a transcription.
+pub fn verify_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("No API key configured".into());
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Could not create API key check".to_owned())?;
+    let response = client
+        .post(ENDPOINT)
+        .header("xi-api-key", key.trim())
+        .multipart(Form::new().text("model_id", "scribe_v2"))
+        .send()
+        .map_err(|e| {
+            if e.is_timeout() {
+                "API key check timed out".to_owned()
+            } else {
+                "API key check could not reach ElevenLabs".to_owned()
+            }
+        })?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|_| format!("Could not read API key check (HTTP {})", status.as_u16()))?;
+    classify_key_response(status, &body)
+}
+
+fn classify_key_response(status: StatusCode, body: &str) -> Result<(), String> {
+    if status == StatusCode::FORBIDDEN {
+        return Err("Key lacks Speech to Text permission".into());
+    }
+    let json = serde_json::from_str::<Value>(body).ok();
+    match json
+        .as_ref()
+        .and_then(|j| j.pointer("/detail/type"))
+        .and_then(Value::as_str)
+    {
+        Some("validation_error") if status == StatusCode::BAD_REQUEST => Ok(()),
+        Some("authentication_error") => Err("Invalid API key".into()),
+        _ => Err(format!("API key check returned HTTP {}", status.as_u16())),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SttOptions {
     pub api_key: String,
@@ -259,6 +303,34 @@ fn response_error(status: StatusCode, body: &str, attempts: u32) -> String {
 mod tests {
     use super::parse_response;
     use crate::types::WordKind;
+
+    #[test]
+    fn classifies_key_probe_without_network() {
+        use super::classify_key_response as classify;
+        use reqwest::StatusCode as S;
+        let valid = r#"{"detail":{"type":"validation_error","message":"Must provide either file or a URL"}}"#;
+        let invalid = r#"{"detail":{"type":"authentication_error"}}"#;
+        assert_eq!(classify(S::BAD_REQUEST, valid), Ok(()));
+        for status in [S::BAD_REQUEST, S::UNAUTHORIZED] {
+            assert_eq!(classify(status, invalid).unwrap_err(), "Invalid API key");
+        }
+        assert_eq!(
+            classify(S::FORBIDDEN, valid).unwrap_err(),
+            "Key lacks Speech to Text permission"
+        );
+        for (status, body) in [
+            (S::OK, valid),
+            (S::BAD_REQUEST, "{}"),
+            (S::INTERNAL_SERVER_ERROR, "not json"),
+            (S::TOO_MANY_REQUESTS, ""),
+        ] {
+            assert!(
+                classify(status, body)
+                    .unwrap_err()
+                    .contains(&status.as_u16().to_string())
+            );
+        }
+    }
 
     const SAMPLE: &str = r#"{
         "language_code": "en",
