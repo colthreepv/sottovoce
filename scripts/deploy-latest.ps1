@@ -206,5 +206,21 @@ foreach ($build in $orderedBuilds) {
     }
 }
 
+# Real deployments only: keep a Start Menu entry pointing through the junction,
+# so it always launches the newest build. Temporary -BuildRoot runs skip this.
+if (-not $PSBoundParameters.ContainsKey('BuildRoot')) {
+    $shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Sottovoce.lnk'
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    if ($shortcut.TargetPath -ne (Join-Path $latestPath 'sottovoce.exe')) {
+        $shortcut.TargetPath = Join-Path $latestPath 'sottovoce.exe'
+        $shortcut.WorkingDirectory = $latestPath
+        $shortcut.IconLocation = "$(Join-Path $latestPath 'sottovoce.exe'),0"
+        $shortcut.Description = 'Sottovoce call recorder (latest build)'
+        $shortcut.Save()
+        Write-Host "Start Menu shortcut: '$shortcutPath'."
+    }
+}
+
 Write-Host "Sottovoce $($package.version) is available at '$latestPath\sottovoce.exe'."
 Write-Host "Build metadata: '$latestPath\build.json'."

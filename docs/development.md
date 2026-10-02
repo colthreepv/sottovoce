@@ -42,6 +42,11 @@ a junction to a managed Sottovoce build. Old builds are pruned after the
 junction switches; builds whose executable is currently running are retained,
 and the helper never stops a process.
 
+A real deployment (no `-BuildRoot`) also keeps a `Sottovoce` Start Menu
+shortcut pointing to `latest\sottovoce.exe`, so the Start Menu always opens the
+newest build. Deploying while the app is open is safe: the running executable
+stays in its versioned folder and only the junction moves.
+
 Agents and tests must never launch, write to, or clean up anything under the
 real `%LOCALAPPDATA%\Sottovoce\builds` directory. For a local deployment test,
 pass a temporary `-BuildRoot`, and use a temporary
