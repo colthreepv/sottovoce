@@ -3,9 +3,19 @@ name: Portable release
 on:
   push:
     tags: ['v*']
+  # PRs only rebuild the package when the packaging itself changes;
+  # ordinary code PRs are covered by the Checks workflow.
   pull_request:
     branches: [main]
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
+
+# Supersede PR runs; never cancel a tag release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
