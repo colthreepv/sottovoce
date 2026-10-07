@@ -8,7 +8,7 @@ publish = false
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-sottovoce_engine = { package = "meeting-recorder-windows", path = "../.." }
+sottovoce_engine = { package = "sottovoce-engine", path = "../.." }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"

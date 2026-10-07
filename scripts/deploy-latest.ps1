@@ -15,7 +15,6 @@ $manifestPath = Join-Path $repoRoot 'Cargo.toml'
 $targetDirectory = [IO.Path]::GetFullPath($TargetDirectory)
 $artifactDefinitions = @(
     @{ Name = 'sottovoce.exe'; Source = { param($releaseDir) Join-Path $releaseDir 'sottovoce.exe' }; Required = $true },
-    @{ Name = 'meeting-recorder.exe'; Source = { param($releaseDir) Join-Path $releaseDir 'meeting-recorder.exe' }; Required = $true },
     @{ Name = 'ffmpeg.exe'; Source = { param($releaseDir) Join-Path $repoRoot 'packaging\dist\ffmpeg.exe' }; Required = $false }
 )
 
@@ -27,12 +26,12 @@ if ([string]::IsNullOrWhiteSpace($BuildRoot)) { throw 'BuildRoot cannot be empty
 $BuildRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($BuildRoot))
 [void][IO.Directory]::CreateDirectory($BuildRoot)
 
-$metadataOutput = & (Join-Path $PSScriptRoot 'cargo.ps1') -Role adept -CargoArgs @('metadata', '--no-deps', '--format-version', '1', '--manifest-path', $manifestPath)
+$metadataOutput = & (Join-Path $PSScriptRoot 'cargo.ps1') -Role builder -CargoArgs @('metadata', '--no-deps', '--format-version', '1', '--manifest-path', $manifestPath)
 $metadataOutput = @($metadataOutput | Where-Object { -not ([string]$_).StartsWith('[cargo.ps1]') })
 if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE." }
 $metadata = ($metadataOutput -join [Environment]::NewLine) | ConvertFrom-Json
-$package = $metadata.packages | Where-Object { $_.name -eq 'meeting-recorder-windows' } | Select-Object -First 1
-if (-not $package) { throw 'Cargo metadata did not contain meeting-recorder-windows.' }
+$package = $metadata.packages | Where-Object { $_.name -eq 'sottovoce-engine' } | Select-Object -First 1
+if (-not $package) { throw 'Cargo metadata did not contain sottovoce-engine.' }
 
 $sourceCommit = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
 if ($LASTEXITCODE -ne 0 -or -not $sourceCommit) { throw 'Could not identify the source commit.' }
@@ -51,7 +50,7 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
     $buildArgs = @('build', '--workspace', '--locked', '--manifest-path', $manifestPath, '--target-dir', $targetDirectory)
     if ($Profile -eq 'release') { $buildArgs += '--release' }
-    & (Join-Path $PSScriptRoot 'cargo.ps1') -Role adept -CargoArgs $buildArgs
+    & (Join-Path $PSScriptRoot 'cargo.ps1') -Role builder -CargoArgs $buildArgs
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE." }
     $builtCommit = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
     if ($LASTEXITCODE -ne 0 -or ([string]$builtCommit).Trim() -ne $sourceCommit) {

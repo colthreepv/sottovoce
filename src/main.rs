@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Meeting Recorder for Windows: records your microphone and the computer's
+//! Sottovoce development CLI: records your microphone and the computer's
 //! audio as separate tracks, finds the speakers on each side with NVIDIA
 //! Nemotron 3 Diarization, transcribes them with ElevenLabs and shows the
 //! conversation.
 
-use sottovoce_engine::{capture, config, core, devices, diarize, elevenlabs, ffmpeg, meetings, pipeline, player, transcript, types};
-mod ui;
+use sottovoce_engine::{
+    capture, config, devices, diarize, elevenlabs, ffmpeg, meetings, pipeline, transcript, types,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,18 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use types::{Abort, Event};
 
-pub use sottovoce_engine::{APP_NAME, log_event, audio_thread_init};
+use sottovoce_engine::log_event;
 
 fn main() {
     std::panic::set_hook(Box::new(|panic| log_event(&format!("PANIC: {panic}"))));
     log_event("Application started");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        if let Err(e) = ui::run() {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-        return;
+        eprintln!("{}", usage());
+        std::process::exit(2);
     }
     attach_console();
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -38,7 +36,6 @@ fn main() {
         "stt" => cli_stt(&args[1..]),
         "devices" => cli_devices(),
         "selftest" => cli_selftest(),
-        "gui-record-test" => cli_gui_record_test(&args[1]),
         _ => Err(usage()),
     });
     if let Err(e) = result {
@@ -55,7 +52,6 @@ fn validate_args(args: &[String]) -> Result<(), String> {
         "diarize" => (1, 1, &["--speakers", "-s"]),
         "stt" => (1, 1, &["--language", "-l"]),
         "devices" | "selftest" => (0, 0, &[]),
-        "gui-record-test" => (1, 1, &[]),
         _ => return Err(usage()),
     };
     let mut positional = 0;
@@ -80,86 +76,17 @@ fn validate_args(args: &[String]) -> Result<(), String> {
     if positional < minimum || positional > maximum {
         return Err(usage());
     }
-    if args[0] == "gui-record-test"
-        && args[1]
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n > 0 && *n <= 600)
-            .is_none()
-    {
-        return Err("gui-record-test needs seconds in 1..=600".into());
-    }
-    Ok(())
-}
-
-fn cli_gui_record_test(seconds: &str) -> Result<(), String> {
-    let root = std::env::temp_dir().join(format!("mr-gui-test-{}", capture::unix_ms()));
-    let meetings_root = root.join("meetings");
-    let tone_dir = root.join("tone");
-    std::fs::create_dir_all(&tone_dir).map_err(|e| e.to_string())?;
-    let status = ffmpeg::command()
-        .args([
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=660:sample_rate=48000",
-            "-t",
-            &(seconds.parse::<u64>().unwrap_or(5) + 10).to_string(),
-            "-c:a",
-            "libopus",
-        ])
-        .arg(tone_dir.join("computer.ogg"))
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("could not create test tone".into());
-    }
-    // Set the test environment before any workers are spawned.
-    unsafe {
-        std::env::set_var("MR_GUI_RECORD_TEST_SECONDS", seconds);
-        std::env::set_var("MR_GUI_TEST_DIR", &meetings_root);
-    }
-    let tone = player::Player::new(&tone_dir);
-    tone.play_from(0);
-    log_event(&format!("GUI recording test: {}", root.display()));
-    ui::run()?;
-    drop(tone);
-    let entry = meetings::list(&meetings_root)
-        .into_iter()
-        .next()
-        .ok_or("GUI test produced no meeting")?;
-    let session = capture::Session::load(&entry.dir).ok_or("GUI test produced no session")?;
-    if session.status != "completed" {
-        return Err(format!("GUI test: session {}", session.status));
-    }
-    for side in [types::Side::Mic, types::Side::Computer] {
-        let samples = ffmpeg::decode_mono_16k(&entry.dir.join(side.file_name()))?;
-        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        let report = format!(
-            "GUI test {}: {} samples, peak {:.1} dBFS, {}",
-            side.label(),
-            samples.len(),
-            20.0 * peak.max(1e-6).log10(),
-            entry.dir.display()
-        );
-        println!("{report}");
-        log_event(&report);
-        if samples.is_empty() || (side == types::Side::Computer && peak < 0.01) {
-            return Err("GUI recording test did not capture the tone".into());
-        }
-    }
     Ok(())
 }
 
 fn usage() -> String {
     [
-        "Usage: meeting-recorder                       open the app",
-        "       meeting-recorder record [folder]       record until Enter",
-        "       meeting-recorder process <folder>      transcribe a recorded meeting",
-        "       meeting-recorder diarize <audio> [--speakers N]",
-        "       meeting-recorder stt <audio> [--language xx]",
-        "       meeting-recorder devices               list audio devices",
-        "       meeting-recorder selftest              record while playing a tone",
+        "Usage: sottovoce-dev-cli record [folder]       record until Enter",
+        "       sottovoce-dev-cli process <folder>      transcribe a recorded meeting",
+        "       sottovoce-dev-cli diarize <audio> [--speakers N]",
+        "       sottovoce-dev-cli stt <audio> [--language xx]",
+        "       sottovoce-dev-cli devices               list audio devices",
+        "       sottovoce-dev-cli selftest              record while playing a tone",
     ]
     .join("\n")
 }
@@ -354,7 +281,7 @@ fn cli_devices() -> Result<(), String> {
 fn cli_selftest() -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let dir =
-        std::env::temp_dir().join(format!("meeting-recorder-selftest-{}", capture::unix_ms()));
+        std::env::temp_dir().join(format!("sottovoce-selftest-{}", capture::unix_ms()));
     let recorder = capture::Recorder::start(
         &dir,
         devices::DeviceChoice::FollowDefault,

@@ -1,41 +1,35 @@
-# Meeting Recorder for Windows
+# Sottovoce
 
-The Windows app records the microphone and Windows output loopback as separate Opus tracks. It includes a GUI, a command line interface, speaker diarization, and optional ElevenLabs transcription. FFmpeg with the `libopus` encoder must be available on `PATH`.
+Sottovoce is a Windows call recorder with a Tauri 2 desktop app. It records
+your microphone and computer audio into separate Ogg Opus tracks. On demand,
+it can identify speakers locally with NVIDIA Nemotron diarization and send the
+recording to ElevenLabs for batch, speaker-attributed transcription.
 
-## Run
-
-Open the GUI:
-
-```powershell
-cargo run --release
-```
-
-Useful command line commands include `devices`, `record [folder]`, `process <folder>`, `diarize <audio>`, `stt <audio>`, and `selftest`.
+Download the portable ZIP from the
+[GitHub Releases](https://github.com/colthreepv/sottovoce/releases), extract it,
+and run `sottovoce.exe`. WebView2 is required (normally already installed on
+Windows 10 and 11). FFmpeg must currently be available on `PATH`, including
+the `libopus` encoder. Transcription requires an ElevenLabs API key.
 
 ## Audio device selection
 
-The recording screen has separate Microphone and Output / loopback selectors. Both default to **Follow Windows default**. Select a device to pin it across sessions; the choice is saved immediately. Device selectors are disabled while recording. The live meters show level and dBFS before recording and continue using the recorder's levels during capture. The idle monitor stops while recording and when the recording screen is not active.
+The recording screen has separate microphone and output loopback selectors.
+Both default to **Follow Windows default**. A pinned device falls back to the
+Windows default if unavailable and is retried during recording. Transcription
+is started manually unless automatic transcription is enabled in Settings.
 
-If a pinned device is unavailable or cannot be opened, capture falls back to the Windows default, records the fallback in `session.json`, and retries the pinned device while recording. It returns to the pinned device if it becomes available again. The command `meeting-recorder devices` lists friendly names, stable cpal IDs, defaults, and formats. IDs can be stored in the configuration below.
+## Data and configuration
 
-## Transcription
+Configuration lives at `%APPDATA%\Sottovoce\config.toml`. Existing settings
+are copied from `%APPDATA%\MeetingRecorder\config.toml` on first startup when
+the new file is absent; the old file is kept. Set `SOTTOVOCE_CONFIG_DIR` to
+override the config folder (`MEETING_RECORDER_CONFIG_DIR` remains a fallback
+alias). Meetings default to `Documents\Meetings`. Models, caches and logs live
+under `%LOCALAPPDATA%\Sottovoce`; the Nemotron model may be downloaded again
+after this directory rename.
 
-Stopping a recording saves it and opens its meeting view. Use **Transcribe** in that view to start transcription manually. In Settings, **Transcribe automatically after stopping** enables automatic transcription; it is off by default. ElevenLabs detects the language automatically.
-
-## Configuration and logs
-
-The configuration file is `%APPDATA%\MeetingRecorder\config.toml`. Set `MEETING_RECORDER_CONFIG_DIR` to override the configuration directory, which is useful for isolated runs. Supported audio and transcription keys include:
-
-```toml
-# Omit or set to false to follow the current Windows default.
-mic_device = "wasapi:{0.0.1.00000000}.{device-guid}"
-output_device = "wasapi:{0.0.0.00000000}.{device-guid}"
-
-# Defaults to false.
-auto_transcribe = false
-```
-
-Application logs are written to `%LOCALAPPDATA%\MeetingRecorder\logs\YYYY-MM-DD.log`.
+For development builds and deployment details, see
+[docs/development.md](docs/development.md).
 
 ## Recordings
 

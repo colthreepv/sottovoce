@@ -24,7 +24,7 @@ versioned directory. The stable junction always launches the selected build:
 
 ```powershell
 .\scripts\deploy-latest.ps1
-& "$env:LOCALAPPDATA\Sottovoce\builds\latest\meeting-recorder.exe"
+& "$env:LOCALAPPDATA\Sottovoce\builds\latest\sottovoce.exe"
 ```
 
 By default, the newest three builds are kept in
@@ -32,10 +32,11 @@ By default, the newest three builds are kept in
 Cargo version and short Git commit, with `-dirty` when the working tree has
 changes. A numeric suffix is added if that name already exists. Each directory
 contains `build.json` with the version, full commit, dirty flag, UTC build
-time, and Rust/Cargo versions. The helper stages `meeting-recorder.exe` and
-copies `packaging\dist\ffmpeg.exe` when that file exists. The artifact list is
+time, and Rust/Cargo versions. The helper stages `sottovoce.exe` and
+copies `packaging\dist\ffmpeg.exe` when that file exists. The development-only
+`sottovoce-dev-cli.exe` is not deployed. The artifact list is
 defined near the top of `scripts\deploy-latest.ps1` and can be updated when
-the executable layout changes, including the planned Tauri frontend.
+the executable layout changes.
 
 The `latest` path is a junction. Deployment refuses to replace it if it is not
 a junction to a managed Sottovoce build. Old builds are pruned after the
@@ -50,7 +51,7 @@ stays in its versioned folder and only the junction moves.
 Agents and tests must never launch, write to, or clean up anything under the
 real `%LOCALAPPDATA%\Sottovoce\builds` directory. For a local deployment test,
 pass a temporary `-BuildRoot`, and use a temporary
-`MEETING_RECORDER_CONFIG_DIR` when launching the app. Do not run tests that
+`SOTTOVOCE_CONFIG_DIR` when launching the app. Do not run tests that
 record or play audio.
 
 The helper accepts `-BuildRoot`, `-KeepBuilds`, and `-SkipBuild`. Use

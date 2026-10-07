@@ -1,4 +1,4 @@
-//! %APPDATA%\MeetingRecorder\config.toml
+//! %APPDATA%\Sottovoce\config.toml
 
 use std::path::PathBuf;
 
@@ -159,6 +159,7 @@ impl Config {
 }
 
 const DEFAULT_TEMPLATE: &str = r#"# Sottovoce settings. Manual edits apply within one second.
+# Stored in %APPDATA%\Sottovoce\config.toml.
 # Empty key uses ELEVENLABS_API_KEY.
 elevenlabs_api_key = ""
 stt_model = "scribe_v2"

@@ -1,12 +1,11 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    End-to-end QA harness for the Windows meeting-recorder crate.
+    End-to-end QA harness for the Sottovoce development CLI.
 
 .DESCRIPTION
     Builds the release binary in its own CARGO_TARGET_DIR, exercises the CLI
-    (selftest, offline pipeline with cached STT responses, help/devices
-    hygiene) and does a best-effort GUI smoke test with screenshots.
+    (selftest, offline pipeline with cached STT responses, and help/devices hygiene).
 
     Every check is recorded as PASS / FAIL / WARN / INFO and printed as a
     table at the end. The script exits 1 when any check FAILs.
@@ -19,7 +18,7 @@
 .PARAMETER SkipSelftest
     Skip the audio selftest (useful on a machine with no capture devices).
 .PARAMETER SkipGui
-    Skip the GUI smoke test and its screenshots.
+    Compatibility flag; the removed egui UI has no GUI smoke test.
 .PARAMETER KeepWork
     Keep the temporary work folder (meeting fixtures, temp APPDATA).
 .PARAMETER WorkRoot
@@ -168,54 +167,18 @@ $repo = $crate
 $fixtures = Join-Path $repo 'testdata\fixtures'
 $sttCache = Join-Path $crate 'testdata\stt'
 $targetDir = Join-Path $env:TEMP 'sottovoce-qa-target'
-$exe = Join-Path $targetDir 'release\meeting-recorder.exe'
+$exe = Join-Path $targetDir 'release\sottovoce-dev-cli.exe'
 
-$screens = Join-Path $WorkRoot 'screens'
 $runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $work = Join-Path $WorkRoot "run-$runStamp"
 $meetingsRoot = Join-Path $work 'meetings'
 $tempAppData = Join-Path $work 'appdata'
-New-Item -ItemType Directory -Force -Path $screens, $work, $meetingsRoot, $tempAppData | Out-Null
+New-Item -ItemType Directory -Force -Path $work, $meetingsRoot, $tempAppData | Out-Null
 
-Write-Host "Meeting Recorder QA harness" -ForegroundColor White
+Write-Host "Sottovoce QA harness" -ForegroundColor White
 Write-Host "crate:      $crate"
 Write-Host "work:       $work"
-Write-Host "screens:    $screens"
 Write-Host "target:     $targetDir"
-
-# dirs::config_dir() uses SHGetKnownFolderPath and ignores the APPDATA
-# environment variable, so a temporary APPDATA does NOT isolate the config:
-# the app always reads %APPDATA%\MeetingRecorder\config.toml. Back that file
-# up, install the QA config in its place, and restore it in the finally block.
-$realConfigDir = Join-Path $env:APPDATA 'MeetingRecorder'
-$realConfig = Join-Path $realConfigDir 'config.toml'
-$configBackup = Join-Path $work 'config.toml.qa-backup'
-$script:ConfigSwapped = $false
-
-function Install-QaConfig {
-    param([Parameter(Mandatory)][string]$Toml)
-    New-Item -ItemType Directory -Force -Path $realConfigDir | Out-Null
-    if (Test-Path -LiteralPath $realConfig) {
-        Copy-Item -LiteralPath $realConfig -Destination $configBackup -Force
-    }
-    Set-TextNoBom -Path $realConfig -Value $Toml
-    $script:ConfigSwapped = $true
-}
-
-function Restore-QaConfig {
-    if (-not $script:ConfigSwapped) { return }
-    try {
-        if (Test-Path -LiteralPath $configBackup) {
-            Copy-Item -LiteralPath $configBackup -Destination $realConfig -Force
-        } elseif (Test-Path -LiteralPath $realConfig) {
-            Remove-Item -LiteralPath $realConfig -Force
-        }
-    } catch {
-        Write-Host "WARNING: could not restore $realConfig ($_)" -ForegroundColor Red
-    }
-}
-
-try {
 
 # --------------------------------------------------------------------------- #
 # 1. Build
@@ -229,9 +192,8 @@ if ($SkipBuild) {
     }
     Add-Result 'build' 'INFO' "skipped, using $exe"
 } else {
-    $env:CARGO_TARGET_DIR = $targetDir
-    $build = Invoke-Captured -File 'cargo' `
-        -Arguments @('build', '--release', '--manifest-path', (Join-Path $crate 'Cargo.toml')) `
+    $build = Invoke-Captured -File 'pwsh' `
+        -Arguments @('-NoProfile', '-File', (Join-Path $repo 'scripts\cargo.ps1'), '-Role', 'builder', 'build', '--release', '--bin', 'sottovoce-dev-cli', '--manifest-path', (Join-Path $crate 'Cargo.toml'), '--target-dir', $targetDir) `
         -WorkingDirectory $crate -TimeoutMs 1800000
     if ($build.TimedOut) {
         Add-Result 'build' 'FAIL' 'cargo build timed out after 30 min'
@@ -298,17 +260,19 @@ if ($SkipSelftest) {
 
 Write-Step '3. Pipeline (cached STT, no API spend)'
 
-# Config seen by the pipeline run and the GUI smoke test. It is written over
-# the real config file (backed up and restored) because dirs ignores APPDATA.
+# Use an explicit temp config path so this harness never touches real AppData.
 $configToml = @(
     "meetings_dir = '$($meetingsRoot -replace '\\', '/')'",
     'diarize = true',
     'language = "auto"'
 ) -join "`n"
-Install-QaConfig -Toml $configToml
+$qaConfigDir = Join-Path $work 'config'
+New-Item -ItemType Directory -Force -Path $qaConfigDir | Out-Null
+Set-TextNoBom -Path (Join-Path $qaConfigDir 'config.toml') -Value $configToml
 
 $childEnv = @{
-    'APPDATA'            = $tempAppData
+    'APPDATA'              = $tempAppData
+    'SOTTOVOCE_CONFIG_DIR' = $qaConfigDir
     'ELEVENLABS_API_KEY' = 'qa-dummy-key-no-spend'
 }
 
@@ -417,15 +381,6 @@ foreach ($case in $pipelineCases) {
 # 4. CLI hygiene
 # --------------------------------------------------------------------------- #
 
-# Rename one processed meeting so the GUI screenshot is unambiguous: the
-# sidebar must show "QA Call Fixture", proving the GUI read our temp folder.
-$guiMeetingJson = Join-Path (Join-Path $meetingsRoot 'call') 'meeting.json'
-if (Test-Path -LiteralPath $guiMeetingJson) {
-    $guiMeeting = Get-Content -LiteralPath $guiMeetingJson -Raw | ConvertFrom-Json
-    $guiMeeting.title = 'QA Call Fixture'
-    Set-TextNoBom -Path $guiMeetingJson -Value ($guiMeeting | ConvertTo-Json -Depth 8)
-}
-
 Write-Step '4. CLI hygiene'
 
 function Test-ClIcreatesFolders {
@@ -467,111 +422,6 @@ if ($devices.ExitCode -ne 0) {
 }
 
 # --------------------------------------------------------------------------- #
-# 5. GUI smoke test + screenshots
-# --------------------------------------------------------------------------- #
-
-Write-Step '5. GUI smoke test'
-
-try {
-    Add-Type -Namespace Win32 -Name Native -ErrorAction Stop -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-[DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT value, int size);
-[StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-'@
-} catch {
-    # Already defined from a previous run in the same session.
-}
-
-function Save-WindowShot {
-    param([Parameter(Mandatory)][IntPtr]$Handle, [Parameter(Mandatory)][string]$Path)
-    Add-Type -AssemblyName System.Drawing
-    $rect = New-Object Win32.Native+RECT
-    # DWMWA_EXTENDED_FRAME_BOUNDS (9) excludes the invisible resize border and
-    # drop shadow that GetWindowRect includes, so the capture is the real window.
-    $ok = $false
-    try {
-        $ok = [Win32.Native]::DwmGetWindowAttribute($Handle, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect)) -eq 0
-    } catch { $ok = $false }
-    if (-not $ok) { $ok = [Win32.Native]::GetWindowRect($Handle, [ref]$rect) }
-    if (-not $ok) { return $false }
-    $width = $rect.Right - $rect.Left
-    $height = $rect.Bottom - $rect.Top
-    if ($width -le 0 -or $height -le 0) { return $false }
-    $bitmap = New-Object System.Drawing.Bitmap $width, $height
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    try {
-        $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
-    } finally {
-        $graphics.Dispose()
-    }
-    $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
-    $bitmap.Dispose()
-    return $true
-}
-
-if ($SkipGui) {
-    Add-Result 'gui/window' 'INFO' 'skipped'
-} else {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    $psi.WorkingDirectory = $work
-    $psi.UseShellExecute = $false
-    foreach ($key in $childEnv.Keys) { $psi.EnvironmentVariables[[string]$key] = [string]$childEnv[$key] }
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    [void]$proc.Start()
-
-    # Wait for the window handle (GPU/eframe init can take a few seconds).
-    $deadline = (Get-Date).AddSeconds(25)
-    while ((Get-Date) -lt $deadline -and $proc.MainWindowHandle -eq [IntPtr]::Zero -and -not $proc.HasExited) {
-        Start-Sleep -Milliseconds 250
-        $proc.Refresh()
-    }
-
-    if ($proc.HasExited) {
-        Add-Result 'gui/window' 'FAIL' "exited early with code $($proc.ExitCode)"
-    } elseif ($proc.MainWindowHandle -eq [IntPtr]::Zero) {
-        Add-Result 'gui/window' 'FAIL' 'no window handle after 25s'
-    } else {
-        $handle = $proc.MainWindowHandle
-        [void][Win32.Native]::ShowWindow($handle, 9)   # SW_RESTORE
-        [void][Win32.Native]::SetForegroundWindow($handle)
-        Start-Sleep -Milliseconds 1500
-
-        $shot1 = Join-Path $screens 'gui-1-recording.png'
-        $ok1 = Save-WindowShot -Handle $handle -Path $shot1
-        Start-Sleep -Seconds 3
-        $shot2 = Join-Path $screens 'gui-2-after.png'
-        $ok2 = Save-WindowShot -Handle $handle -Path $shot2
-
-        if ($ok1 -and $ok2) {
-            Add-Result 'gui/window' 'PASS' "window shown; screenshots: $shot1, $shot2"
-        } else {
-            Add-Result 'gui/window' 'WARN' 'window shown but screenshots could not be captured'
-        }
-
-        # WM_CLOSE and watch for exit.
-        $closeSw = [System.Diagnostics.Stopwatch]::StartNew()
-        [void]$proc.CloseMainWindow()
-        $exited = $proc.WaitForExit(10000)
-        $closeSw.Stop()
-        if ($exited) {
-            Add-Result 'gui/close' 'PASS' "exited after $([math]::Round($closeSw.Elapsed.TotalSeconds, 1))s"
-        } else {
-            Add-Result 'gui/close' 'WARN' 'still running 10s after WM_CLOSE (known bug, not a hard failure)'
-        }
-    }
-
-    if (-not $proc.HasExited) {
-        try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
-        [void]$proc.WaitForExit(5000)
-    }
-}
-
-# --------------------------------------------------------------------------- #
 # Summary
 # --------------------------------------------------------------------------- #
 
@@ -581,12 +431,9 @@ $failed = @($script:Results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $warned = @($script:Results | Where-Object { $_.Status -eq 'WARN' }).Count
 $passed = @($script:Results | Where-Object { $_.Status -eq 'PASS' }).Count
 Write-Host "$passed passed, $warned warned, $failed failed" -ForegroundColor $(if ($failed -gt 0) { 'Red' } else { 'Green' })
-Write-Host "screenshots: $screens"
+
 
 $script:ExitCode = if ($failed -gt 0) { 1 } else { 0 }
-} finally {
-    Restore-QaConfig
-}
 
 if (-not $KeepWork) {
     try { Remove-Item -LiteralPath $work -Recurse -Force } catch { }

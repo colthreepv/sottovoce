@@ -1,4 +1,4 @@
-//! Shared Sottovoce engine for the legacy egui and Tauri frontends.
+//! Shared Sottovoce engine for the Tauri desktop app and development CLI.
 pub mod app_audio;
 pub mod capture;
 pub mod config;
@@ -16,7 +16,7 @@ pub mod player;
 pub mod transcript;
 pub mod types;
 
-pub const APP_NAME: &str = "Meeting Recorder";
+pub const APP_NAME: &str = "Sottovoce";
 
 pub fn log_event(message: &str) {
     use std::io::Write;
