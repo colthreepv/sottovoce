@@ -27,5 +27,8 @@ jobs:
       - name: Check frontend
         working-directory: app/ui
         run: bun run check
+      - name: Build frontend assets for Tauri tests
+        working-directory: app/ui
+        run: bun run build
       - name: Test Rust workspace
         run: cargo test --workspace --locked
