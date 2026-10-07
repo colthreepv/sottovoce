@@ -65,3 +65,27 @@ dedicated `%TEMP%\sottovoce-deploy-target\release` directory:
 
 The Cargo release build always uses `--locked` and writes to that dedicated
 target directory rather than the repository's default `target` directory.
+
+## Releases
+
+Push a `v*` tag matching the versions in the root Cargo package and Tauri
+configuration to build and publish a portable Windows x64 ZIP. GitHub Actions
+cross-builds the pinned, LGPL FFmpeg with libopus, caches that build by its
+Dockerfile and source pins, then builds and verifies the app and bundled
+FFmpeg on Windows. The release includes `sottovoce.exe`, its runtime DLLs,
+`ffmpeg.exe`, third-party notices, license texts, and `SHA256SUMS`. Builds are
+unsigned, so Windows SmartScreen may show a warning.
+
+Use **Actions → Portable release → Run workflow** to build the ZIP without
+publishing a release; the ZIP and checksum are available as workflow artifacts.
+For a local package, build the frontend and Tauri app, build FFmpeg with
+`packaging/build-ffmpeg.ps1`, then assemble the archive:
+
+```powershell
+bun install --cwd app/ui
+bun run --cwd app/ui build
+pwsh -File scripts/cargo.ps1 -Role builder build --release --locked -p sottovoce
+pwsh -File packaging/build-ffmpeg.ps1
+pwsh -File packaging/package.ps1 -ReleaseDirectory target/release `
+  -FfmpegPath packaging/dist/ffmpeg.exe
+```

@@ -79,7 +79,7 @@ RUN cp "downloads/ffmpeg-${FFMPEG_VERSION}.tar.xz" ffmpeg.tar.xz \
         --enable-demuxer=ogg,wav,mp3,mov,matroska,flac,aac,pcm_s16le \
         --enable-decoder=opus,vorbis,mp3,mp3float,aac,flac,alac,pcm_* \
         --enable-encoder=libopus,pcm_s16le,pcm_f32le \
-        --enable-muxer=ogg,pcm_s16le,pcm_f32le,wav \
+        --enable-muxer=ogg,pcm_s16le,pcm_f32le,wav,null \
         --enable-parser=opus,vorbis,flac,aac,mpegaudio \
         --enable-filter=aresample,aformat,anull,abuffer,abuffersink \
         --enable-libopus \
