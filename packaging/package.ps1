@@ -1,98 +1,107 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$ReleaseDirectory,
+    [Parameter(Mandatory)][string]$FfmpegPath,
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'dist')
+)
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$crateRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$manifestPath = Join-Path $crateRoot 'Cargo.toml'
-$manifest = Get-Content -LiteralPath $manifestPath -Raw
-$versionMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"')
-if (-not $versionMatch.Success) {
-    throw "Could not read the crate version from $manifestPath"
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$releaseDirectory = (Resolve-Path -LiteralPath $ReleaseDirectory).Path
+$ffmpegPath = (Resolve-Path -LiteralPath $FfmpegPath).Path
+$outputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+$engineManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Raw
+$engineVersionMatch = [regex]::Match($engineManifest, '(?s)\[package\].*?name\s*=\s*"sottovoce-engine".*?version\s*=\s*"([^"]+)"')
+if (-not $engineVersionMatch.Success) { throw 'Could not read the sottovoce-engine version from Cargo.toml.' }
+$version = $engineVersionMatch.Groups[1].Value
+$tauriManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'app/src-tauri/Cargo.toml') -Raw
+$tauriVersionMatch = [regex]::Match($tauriManifest, '(?s)\[package\].*?name\s*=\s*"sottovoce".*?version\s*=\s*"([^"]+)"')
+$tauriConfig = Get-Content -LiteralPath (Join-Path $repoRoot 'app/src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json
+if (-not $tauriVersionMatch.Success -or $tauriVersionMatch.Groups[1].Value -ne $version -or $tauriConfig.version -ne $version) {
+    throw 'Cargo engine, Tauri package, and Tauri config versions must match.'
 }
-$version = $versionMatch.Groups[1].Value
 
-$distPath = Join-Path $PSScriptRoot 'dist'
-$ffmpegPath = Join-Path $distPath 'ffmpeg.exe'
-if (-not (Test-Path -LiteralPath $ffmpegPath -PathType Leaf)) {
-    & (Join-Path $PSScriptRoot 'build-ffmpeg.ps1')
-    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
-        throw "The FFmpeg build failed with exit code $LASTEXITCODE"
+$appPath = Join-Path $releaseDirectory 'sottovoce.exe'
+$directMlPath = Join-Path $releaseDirectory 'DirectML.dll'
+foreach ($requiredPath in @($appPath, $directMlPath, $ffmpegPath)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+        throw "Required release file is missing: $requiredPath"
     }
 }
-& (Join-Path $PSScriptRoot 'verify-ffmpeg.ps1') -FfmpegPath $ffmpegPath
-
-$cargoCommand = Get-Command cargo.exe -ErrorAction Stop
-& $cargoCommand.Source build --manifest-path $manifestPath --release
-if ($LASTEXITCODE -ne 0) {
-    throw "The meeting-recorder release build failed with exit code $LASTEXITCODE"
+if ((Get-Item -LiteralPath $ffmpegPath).Length -ge 10MB) {
+    throw 'Bundled FFmpeg must be smaller than 10 MB.'
 }
 
-$appPath = Join-Path $crateRoot 'target\release\meeting-recorder.exe'
-if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
-    throw "Cargo succeeded but the binary is missing: $appPath"
-}
+$outputDirectory = [IO.Path]::GetFullPath($outputDirectory)
+[void][IO.Directory]::CreateDirectory($outputDirectory)
+$zipName = "sottovoce-$version-windows-x64.zip"
+$zipPath = Join-Path $outputDirectory $zipName
+$stagingPath = Join-Path ([IO.Path]::GetTempPath()) "sottovoce-package-$([Guid]::NewGuid().ToString('N'))"
+$archivePath = Join-Path ([IO.Path]::GetTempPath()) "sottovoce-package-$([Guid]::NewGuid().ToString('N')).zip"
 
-$packageName = "MeetingRecorder-$version-win64"
-$packagePath = Join-Path $distPath $packageName
-$zipPath = Join-Path $distPath "$packageName.zip"
-$distFullPath = [System.IO.Path]::GetFullPath($distPath).TrimEnd('\') + '\'
-foreach ($generatedPath in @($packagePath, $zipPath)) {
-    $generatedFullPath = [System.IO.Path]::GetFullPath($generatedPath)
-    if (-not $generatedFullPath.StartsWith($distFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to replace a package output outside $distPath"
+try {
+    [void][IO.Directory]::CreateDirectory($stagingPath)
+    Copy-Item -LiteralPath $appPath -Destination (Join-Path $stagingPath 'sottovoce.exe')
+    Copy-Item -LiteralPath $ffmpegPath -Destination (Join-Path $stagingPath 'ffmpeg.exe')
+    Get-ChildItem -LiteralPath $releaseDirectory -Filter '*.dll' -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stagingPath $_.Name) -Force
     }
-}
-if (Test-Path -LiteralPath $packagePath) {
-    Remove-Item -LiteralPath $packagePath -Recurse -Force
-}
-if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-}
-New-Item -ItemType Directory -Path (Join-Path $packagePath 'licenses') -Force | Out-Null
-
-Copy-Item -LiteralPath $appPath -Destination (Join-Path $packagePath 'meeting-recorder.exe')
-Copy-Item -LiteralPath $ffmpegPath -Destination (Join-Path $packagePath 'ffmpeg.exe')
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.txt') -Destination $packagePath
-
-$licenseFiles = @(
-    @{ Source = (Join-Path $distPath 'licenses\FFmpeg-LGPL-2.1.txt'); Name = 'FFmpeg-LGPL-2.1.txt' },
-    @{ Source = (Join-Path $distPath 'licenses\libopus-BSD.txt'); Name = 'libopus-BSD.txt' },
-    @{ Source = (Join-Path $PSScriptRoot 'licenses\ONNX-Runtime-MIT.txt'); Name = 'ONNX-Runtime-MIT.txt' },
-    @{ Source = (Join-Path $PSScriptRoot 'licenses\Nemotron-OpenMDW-1.1.txt'); Name = 'Nemotron-OpenMDW-1.1.txt' }
-)
-foreach ($license in $licenseFiles) {
-    if (-not (Test-Path -LiteralPath $license.Source -PathType Leaf)) {
-        throw "Required third-party license file is missing: $($license.Source)"
+    $resources = Join-Path $releaseDirectory 'resources'
+    if (Test-Path -LiteralPath $resources -PathType Container) {
+        Copy-Item -LiteralPath $resources -Destination (Join-Path $stagingPath 'resources') -Recurse
     }
-    Copy-Item -LiteralPath $license.Source -Destination (Join-Path $packagePath "licenses\$($license.Name)")
-}
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.txt') -Destination $stagingPath
 
-$readme = @'
-Meeting Recorder for Windows
+    $licenseSources = @(
+        @{ Source = (Join-Path (Split-Path -Parent $ffmpegPath) 'licenses/FFmpeg-LGPL-2.1.txt'); Name = 'FFmpeg-LGPL-2.1.txt' },
+        @{ Source = (Join-Path (Split-Path -Parent $ffmpegPath) 'licenses/libopus-BSD.txt'); Name = 'libopus-BSD.txt' },
+        @{ Source = (Join-Path $PSScriptRoot 'licenses/ONNX-Runtime-MIT.txt'); Name = 'ONNX-Runtime-MIT.txt' },
+        @{ Source = (Join-Path $PSScriptRoot 'licenses/Nemotron-OpenMDW-1.1.txt'); Name = 'Nemotron-OpenMDW-1.1.txt' }
+    )
+    $licensesDirectory = Join-Path $stagingPath 'licenses'
+    [void][IO.Directory]::CreateDirectory($licensesDirectory)
+    foreach ($license in $licenseSources) {
+        if (-not (Test-Path -LiteralPath $license.Source -PathType Leaf)) {
+            throw "Required license file is missing: $($license.Source)"
+        }
+        Copy-Item -LiteralPath $license.Source -Destination (Join-Path $licensesDirectory $license.Name)
+    }
 
-Run meeting-recorder.exe to open the app. Recording creates separate mic.ogg
-and computer.ogg tracks; processing builds the merged conversation transcript.
-Set your ElevenLabs API key in Settings or in config.toml before transcription.
+    $readme = @'
+Sottovoce for Windows x64
 
-Files and first run
-  Settings: %APPDATA%\MeetingRecorder\config.toml
-  Meetings: %USERPROFILE%\Documents\Meetings
-  Models:   %LOCALAPPDATA%\MeetingRecorder\models
+Run sottovoce.exe. The portable folder includes FFmpeg and the runtime DLLs.
+Set your ElevenLabs API key in Settings or in %APPDATA%\Sottovoce\config.toml.
+Meetings default to %USERPROFILE%\Documents\Meetings. Nemotron diarization
+downloads its model the first time it is used.
 
-Speaker diarization downloads NVIDIA Nemotron 3 locally the first time it is
-used (about 120 MB). FFmpeg is included beside the app and is used for audio
-recording, import, and playback.
-
-The command line is also available from Command Prompt or PowerShell:
-  meeting-recorder.exe record [folder]
-  meeting-recorder.exe process <folder>
-  meeting-recorder.exe diarize <audio> [--speakers N]
-  meeting-recorder.exe stt <audio> [--language xx]
-
+This build is unsigned. Windows SmartScreen may show a warning when you run it.
 See THIRD-PARTY-NOTICES.txt and the licenses folder for component notices.
 '@
-Set-Content -LiteralPath (Join-Path $packagePath 'README.txt') -Value $readme -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $stagingPath 'README.txt') -Value $readme -Encoding UTF8
 
-Compress-Archive -Path $packagePath -DestinationPath $zipPath -CompressionLevel Optimal
-$zipSize = (Get-Item -LiteralPath $zipPath).Length
-Write-Host "Package: $packagePath"
-Write-Host ("Archive: {0} ({1:N2} MB)" -f $zipPath, ($zipSize / 1MB))
+    Compress-Archive -Path (Join-Path $stagingPath '*') -DestinationPath $archivePath -CompressionLevel Optimal
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($archivePath)
+    try {
+        $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+    } finally {
+        $zip.Dispose()
+    }
+    foreach ($requiredEntry in @(
+        'sottovoce.exe', 'DirectML.dll', 'ffmpeg.exe', 'README.txt',
+        'THIRD-PARTY-NOTICES.txt', 'licenses/FFmpeg-LGPL-2.1.txt',
+        'licenses/libopus-BSD.txt', 'licenses/ONNX-Runtime-MIT.txt',
+        'licenses/Nemotron-OpenMDW-1.1.txt'
+    )) {
+        if ($entries -notcontains $requiredEntry) { throw "Package archive is missing $requiredEntry" }
+    }
+    Move-Item -LiteralPath $archivePath -Destination $zipPath -Force
+    Write-Host "Portable package: $zipPath"
+    Write-Host ("Archive size: {0:N2} MB" -f ((Get-Item -LiteralPath $zipPath).Length / 1MB))
+} finally {
+    if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force }
+    if (Test-Path -LiteralPath $stagingPath) { Remove-Item -LiteralPath $stagingPath -Recurse -Force }
+}

@@ -1,6 +1,6 @@
 param(
-    [string]$FfmpegVersion = '8.1.3',
-    [string]$OpusVersion = '1.5.2'
+    [string]$FfmpegVersion,
+    [string]$OpusVersion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,21 +9,18 @@ Set-StrictMode -Version Latest
 $dockerCommand = Get-Command docker.exe -ErrorAction Stop
 $outputPath = Join-Path $PSScriptRoot 'dist'
 $outputFullPath = [System.IO.Path]::GetFullPath($outputPath)
+$pins = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ffmpeg-pins.json') -Raw | ConvertFrom-Json
+if ([string]::IsNullOrWhiteSpace($FfmpegVersion)) { $FfmpegVersion = $pins.ffmpeg.version }
+if ([string]::IsNullOrWhiteSpace($OpusVersion)) { $OpusVersion = $pins.opus.version }
+if ($FfmpegVersion -ne $pins.ffmpeg.version -or $OpusVersion -ne $pins.opus.version) {
+    throw 'Requested versions must match packaging/ffmpeg-pins.json; update the pins and Dockerfile together.'
+}
 $archivePins = @{
-    'ffmpeg-8.1.3.tar.xz' = @{
-        Url = 'https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz'
-        Sha256 = '7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3'
-    }
-    'opus-1.5.2.tar.gz' = @{
-        Url = 'https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz'
-        Sha256 = '65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1'
-    }
+    "ffmpeg-$FfmpegVersion.tar.xz" = @{ Url = $pins.ffmpeg.url; Sha256 = $pins.ffmpeg.sha256 }
+    "opus-$OpusVersion.tar.gz" = @{ Url = $pins.opus.url; Sha256 = $pins.opus.sha256 }
 }
 $ffmpegArchiveName = "ffmpeg-$FfmpegVersion.tar.xz"
 $opusArchiveName = "opus-$OpusVersion.tar.gz"
-if (-not $archivePins.ContainsKey($ffmpegArchiveName) -or -not $archivePins.ContainsKey($opusArchiveName)) {
-    throw 'Update the pinned source URLs and SHA-256 values before changing the FFmpeg or libopus versions.'
-}
 $cachePath = Join-Path $PSScriptRoot 'build-cache'
 New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
 foreach ($archiveName in @($ffmpegArchiveName, $opusArchiveName)) {

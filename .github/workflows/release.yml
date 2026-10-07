@@ -1,0 +1,164 @@
+name: Portable release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ffmpeg:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.ffmpeg-cache.outputs.cache-hit }}
+      build-seconds: ${{ steps.build.outputs.seconds }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore the pinned FFmpeg build
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: packaging/dist
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('packaging/Dockerfile', 'packaging/ffmpeg-pins.json') }}
+      - name: Build FFmpeg when the pins or configuration change
+        id: build
+        shell: bash
+        run: |
+          start=$SECONDS
+          if [[ "${{ steps.ffmpeg-cache.outputs.cache-hit }}" != "true" ]]; then
+            mkdir -p packaging/build-cache packaging/dist
+            ffmpeg_version="$(jq -r '.ffmpeg.version' packaging/ffmpeg-pins.json)"
+            ffmpeg_url="$(jq -r '.ffmpeg.url' packaging/ffmpeg-pins.json)"
+            ffmpeg_sha="$(jq -r '.ffmpeg.sha256' packaging/ffmpeg-pins.json)"
+            opus_version="$(jq -r '.opus.version' packaging/ffmpeg-pins.json)"
+            opus_url="$(jq -r '.opus.url' packaging/ffmpeg-pins.json)"
+            opus_sha="$(jq -r '.opus.sha256' packaging/ffmpeg-pins.json)"
+            grep -Fxq "ARG FFMPEG_VERSION=$ffmpeg_version" packaging/Dockerfile
+            grep -Fxq "ARG OPUS_VERSION=$opus_version" packaging/Dockerfile
+            curl --fail --location --retry 3 --retry-all-errors "$ffmpeg_url" \
+              --output "packaging/build-cache/ffmpeg-${ffmpeg_version}.tar.xz"
+            curl --fail --location --retry 3 --retry-all-errors "$opus_url" \
+              --output "packaging/build-cache/opus-${opus_version}.tar.gz"
+            (cd packaging/build-cache && printf '%s  %s\n' "$ffmpeg_sha" "ffmpeg-${ffmpeg_version}.tar.xz" | sha256sum --check)
+            (cd packaging/build-cache && printf '%s  %s\n' "$opus_sha" "opus-${opus_version}.tar.gz" | sha256sum --check)
+            docker buildx build \
+              --platform linux/amd64 \
+              --build-arg "FFMPEG_VERSION=$ffmpeg_version" \
+              --build-arg "OPUS_VERSION=$opus_version" \
+              --target artifact \
+              --output type=local,dest=packaging/dist \
+              --tag "sottovoce-ffmpeg:${ffmpeg_version}-opus-${opus_version}" \
+              --file packaging/Dockerfile \
+              packaging
+          fi
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+      - name: Verify the Windows binary and license bundle
+        shell: bash
+        run: |
+          test -f packaging/dist/ffmpeg.exe
+          test -f packaging/dist/licenses/FFmpeg-LGPL-2.1.txt
+          test -f packaging/dist/licenses/libopus-BSD.txt
+          size=$(stat -c %s packaging/dist/ffmpeg.exe)
+          test "$size" -lt 10000000
+          file packaging/dist/ffmpeg.exe | tee /dev/stderr | grep -F 'PE32+ executable (console) x86-64'
+          sha256sum packaging/dist/ffmpeg.exe
+          echo "FFmpeg build/cache step: ${{ steps.ffmpeg-cache.outputs.cache-hit == 'true' && 'cache hit' || 'cache miss' }}; elapsed ${{ steps.build.outputs.seconds }} seconds"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-bundle
+          path: packaging/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  app:
+    runs-on: windows-latest
+    needs: ffmpeg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: Validate tag and embedded app versions
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $engine = Get-Content Cargo.toml -Raw
+          $engineMatch = [regex]::Match($engine, '(?s)\[package\].*?name\s*=\s*"sottovoce-engine".*?version\s*=\s*"([^"]+)"')
+          $tauri = Get-Content app/src-tauri/Cargo.toml -Raw
+          $tauriMatch = [regex]::Match($tauri, '(?s)\[package\].*?name\s*=\s*"sottovoce".*?version\s*=\s*"([^"]+)"')
+          $config = Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if (-not $engineMatch.Success -or -not $tauriMatch.Success) { throw 'Could not read package versions.' }
+          $version = $engineMatch.Groups[1].Value
+          if ($tauriMatch.Groups[1].Value -ne $version -or $config.version -ne $version) {
+            throw 'Cargo and Tauri versions do not match.'
+          }
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match package version v$version."
+          }
+      - name: Install frontend dependencies
+        working-directory: app/ui
+        run: bun install --frozen-lockfile
+      - name: Build frontend
+        working-directory: app/ui
+        run: bun run build
+      - name: Build Windows app
+        run: cargo build --release --locked -p sottovoce
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-bundle
+          path: packaging/dist
+      - name: Install FFmpeg reference tool for the bundle checks
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          $chocoBin = Join-Path $env:ProgramData 'chocolatey/bin'
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $chocoBin
+          $env:PATH = "$chocoBin;$env:PATH"
+          Get-Command ffmpeg.exe
+      - name: Verify bundled FFmpeg commands and decoders
+        run: pwsh -File packaging/verify-ffmpeg.ps1 -FfmpegPath packaging/dist/ffmpeg.exe
+      - name: Package the portable ZIP
+        run: pwsh -File packaging/package.ps1 -ReleaseDirectory target/release -FfmpegPath packaging/dist/ffmpeg.exe -OutputDirectory "$env:RUNNER_TEMP/release"
+      - name: Create SHA256SUMS
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -LiteralPath $env:RUNNER_TEMP/release -Filter 'sottovoce-*-windows-x64.zip' -File | Select-Object -First 1
+          if (-not $zip) { throw 'Portable release ZIP was not created.' }
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $line = "$hash  $($zip.Name)`n"
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP/release 'SHA256SUMS'), $line, [Text.UTF8Encoding]::new($false))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: app
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: release-files
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Sottovoce ${{ github.ref_name }}
+          body: |
+            Portable Windows x64 build. This build is unsigned, so Windows SmartScreen may show a warning on first run.
+          files: |
+            release-files/sottovoce-*-windows-x64.zip
+            release-files/SHA256SUMS

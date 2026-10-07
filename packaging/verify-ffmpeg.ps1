@@ -128,7 +128,7 @@ $ReferenceFfmpeg = (Resolve-Path -LiteralPath $ReferenceFfmpeg).Path
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $fixtureRoot = Join-Path $repoRoot 'testdata\fixtures'
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("meeting-recorder-ffmpeg-check-" + [guid]::NewGuid().ToString('N'))
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sottovoce-ffmpeg-check-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 
 try {
@@ -138,6 +138,13 @@ try {
         throw 'The bundled FFmpeg encoder list does not contain libopus.'
     }
     Write-Host 'PASS: -encoders lists libopus'
+
+    $muxerListing = Invoke-ProcessCapture -Executable $FfmpegPath -Arguments @('-hide_banner', '-nostdin', '-loglevel', 'error', '-muxers')
+    Assert-ProcessSucceeded $muxerListing 'Bundled FFmpeg -muxers'
+    if ($muxerListing.Stdout -notmatch '(?m)^\s*E\s+null\s') {
+        throw 'The bundled FFmpeg muxer list does not contain null.'
+    }
+    Write-Host 'PASS: -muxers lists null'
 
     $rawPcm = Join-Path $tempRoot 'capture-input.s16le'
     $generated = Invoke-ProcessCapture -Executable $ReferenceFfmpeg -Arguments @(
@@ -176,6 +183,12 @@ try {
         Assert-ProcessSucceeded $referenceDecode "System FFmpeg decode of $($fixture.FullName)"
         $bundledDecode = Invoke-ProcessCapture -Executable $FfmpegPath -Arguments $decodeArguments -StdoutPath $bundledRaw
         Assert-ProcessSucceeded $bundledDecode "Bundled FFmpeg decode of $($fixture.FullName)"
+
+        $durationProbe = Invoke-ProcessCapture -Executable $FfmpegPath -Arguments @(
+            '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', $fixture.FullName,
+            '-f', 'null', 'NUL'
+        )
+        Assert-ProcessSucceeded $durationProbe "Bundled FFmpeg null-muxer probe of $($fixture.FullName)"
 
         $referenceBytes = (Get-Item -LiteralPath $referenceRaw).Length
         $bundledBytes = (Get-Item -LiteralPath $bundledRaw).Length

@@ -1,11 +1,11 @@
-Meeting Recorder for Windows includes or downloads the following third-party components.
+Sottovoce includes or downloads the following third-party components.
 
 FFmpeg 8.1.3
   License: GNU Lesser General Public License, version 2.1 (LGPL-2.1)
   Source: https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz
   License text: licenses/FFmpeg-LGPL-2.1.txt
   Configure line:
-  ./configure --prefix=/opt/win64 --arch=x86_64 --target-os=mingw32 --cross-prefix=x86_64-w64-mingw32- --enable-cross-compile --pkg-config=pkg-config --pkg-config-flags=--static --enable-static --disable-shared --disable-everything --disable-gpl --disable-version3 --disable-nonfree --disable-network --disable-autodetect --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --enable-ffmpeg --enable-protocol=file,pipe --enable-demuxer=ogg,wav,mp3,mov,matroska,flac,aac,pcm_s16le --enable-decoder=opus,vorbis,mp3,mp3float,aac,flac,alac,pcm_* --enable-encoder=libopus,pcm_s16le,pcm_f32le --enable-muxer=ogg,pcm_s16le,pcm_f32le,wav --enable-parser=opus,vorbis,flac,aac,mpegaudio --enable-filter=aresample,aformat,anull,abuffer,abuffersink --enable-libopus --enable-small --extra-cflags="-Os -I/opt/win64/include -ffunction-sections -fdata-sections" --extra-ldflags="-L/opt/win64/lib -static -static-libgcc -Wl,--gc-sections"
+  PKG_CONFIG_PATH=/opt/win64/lib/pkgconfig ./configure --prefix=/opt/win64 --arch=x86_64 --target-os=mingw32 --cross-prefix=x86_64-w64-mingw32- --enable-cross-compile --pkg-config=pkg-config --pkg-config-flags=--static --enable-static --disable-shared --disable-everything --disable-gpl --disable-version3 --disable-nonfree --disable-network --disable-autodetect --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --enable-ffmpeg --enable-protocol=file,pipe --enable-demuxer=ogg,wav,mp3,mov,matroska,flac,aac,pcm_s16le --enable-decoder=opus,vorbis,mp3,mp3float,aac,flac,alac,pcm_* --enable-encoder=libopus,pcm_s16le,pcm_f32le --enable-muxer=ogg,pcm_s16le,pcm_f32le,wav,null --enable-parser=opus,vorbis,flac,aac,mpegaudio --enable-filter=aresample,aformat,anull,abuffer,abuffersink --enable-libopus --enable-small --extra-cflags="-Os -I/opt/win64/include -ffunction-sections -fdata-sections" --extra-ldflags="-L/opt/win64/lib -static -static-libgcc -Wl,--gc-sections"
 
 libopus 1.5.2
   License: BSD
