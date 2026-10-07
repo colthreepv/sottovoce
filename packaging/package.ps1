@@ -10,9 +10,9 @@ Set-StrictMode -Version Latest
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $releaseDirectory = (Resolve-Path -LiteralPath $ReleaseDirectory).Path
-$ffmpegPath = $null
+$resolvedFfmpegPath = $null
 if (-not [string]::IsNullOrWhiteSpace($FfmpegPath)) {
-    $ffmpegPath = (Resolve-Path -LiteralPath $FfmpegPath).Path
+    $resolvedFfmpegPath = (Resolve-Path -LiteralPath $FfmpegPath).Path
 }
 $outputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $engineManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Raw
@@ -33,10 +33,10 @@ foreach ($requiredPath in @($appPath, $directMlPath)) {
         throw "Required release file is missing: $requiredPath"
     }
 }
-if ($ffmpegPath -and -not (Test-Path -LiteralPath $ffmpegPath -PathType Leaf)) {
-    throw "Required release file is missing: $ffmpegPath"
+if ($resolvedFfmpegPath -and -not (Test-Path -LiteralPath $resolvedFfmpegPath -PathType Leaf)) {
+    throw "Required release file is missing: $resolvedFfmpegPath"
 }
-if ($ffmpegPath -and (Get-Item -LiteralPath $ffmpegPath).Length -ge 10MB) {
+if ($resolvedFfmpegPath -and (Get-Item -LiteralPath $resolvedFfmpegPath).Length -ge 10MB) {
     throw 'Bundled FFmpeg must be smaller than 10 MB.'
 }
 
@@ -50,8 +50,8 @@ $archivePath = Join-Path ([IO.Path]::GetTempPath()) "sottovoce-package-$([Guid]:
 try {
     [void][IO.Directory]::CreateDirectory($stagingPath)
     Copy-Item -LiteralPath $appPath -Destination (Join-Path $stagingPath 'sottovoce.exe')
-    if ($ffmpegPath) {
-        Copy-Item -LiteralPath $ffmpegPath -Destination (Join-Path $stagingPath 'ffmpeg.exe')
+    if ($resolvedFfmpegPath) {
+        Copy-Item -LiteralPath $resolvedFfmpegPath -Destination (Join-Path $stagingPath 'ffmpeg.exe')
     }
     Get-ChildItem -LiteralPath $releaseDirectory -Filter '*.dll' -File | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stagingPath $_.Name) -Force
@@ -61,7 +61,7 @@ try {
         Copy-Item -LiteralPath $resources -Destination (Join-Path $stagingPath 'resources') -Recurse
     }
     $noticesPath = Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.txt'
-    if ($ffmpegPath) {
+    if ($resolvedFfmpegPath) {
         Copy-Item -LiteralPath $noticesPath -Destination $stagingPath
     } else {
         $notices = Get-Content -LiteralPath $noticesPath -Raw
@@ -77,10 +77,10 @@ try {
         @{ Source = (Join-Path $PSScriptRoot 'licenses/ONNX-Runtime-MIT.txt'); Name = 'ONNX-Runtime-MIT.txt' },
         @{ Source = (Join-Path $PSScriptRoot 'licenses/Nemotron-OpenMDW-1.1.txt'); Name = 'Nemotron-OpenMDW-1.1.txt' }
     )
-    if ($ffmpegPath) {
+    if ($resolvedFfmpegPath) {
         $licenseSources = @(
-            @{ Source = (Join-Path (Split-Path -Parent $ffmpegPath) 'licenses/FFmpeg-LGPL-2.1.txt'); Name = 'FFmpeg-LGPL-2.1.txt' },
-            @{ Source = (Join-Path (Split-Path -Parent $ffmpegPath) 'licenses/libopus-BSD.txt'); Name = 'libopus-BSD.txt' }
+            @{ Source = (Join-Path (Split-Path -Parent $resolvedFfmpegPath) 'licenses/FFmpeg-LGPL-2.1.txt'); Name = 'FFmpeg-LGPL-2.1.txt' },
+            @{ Source = (Join-Path (Split-Path -Parent $resolvedFfmpegPath) 'licenses/libopus-BSD.txt'); Name = 'libopus-BSD.txt' }
         ) + $licenseSources
     }
     $licensesDirectory = Join-Path $stagingPath 'licenses'
@@ -92,7 +92,7 @@ try {
         Copy-Item -LiteralPath $license.Source -Destination (Join-Path $licensesDirectory $license.Name)
     }
 
-    $ffmpegReadme = if ($ffmpegPath) {
+    $ffmpegReadme = if ($resolvedFfmpegPath) {
         'The portable folder includes FFmpeg and the runtime DLLs.'
     } else {
         'This local package does not include FFmpeg; install it on PATH to use audio features.'
@@ -123,7 +123,7 @@ See THIRD-PARTY-NOTICES.txt and the licenses folder for component notices.
         'THIRD-PARTY-NOTICES.txt', 'licenses/ONNX-Runtime-MIT.txt',
         'licenses/Nemotron-OpenMDW-1.1.txt'
     )
-    if ($ffmpegPath) {
+    if ($resolvedFfmpegPath) {
         $requiredEntries += @('ffmpeg.exe', 'licenses/FFmpeg-LGPL-2.1.txt', 'licenses/libopus-BSD.txt')
     }
     foreach ($requiredEntry in $requiredEntries) {
