@@ -50,7 +50,7 @@ New-Item -ItemType Directory -Path $outputFullPath -Force | Out-Null
     --build-arg "OPUS_VERSION=$OpusVersion" `
     --target artifact `
     --output "type=local,dest=$outputFullPath" `
-    --tag "meeting-recorder-ffmpeg:$FfmpegVersion-opus-$OpusVersion" `
+    --tag "sottovoce-ffmpeg:$FfmpegVersion-opus-$OpusVersion" `
     --file (Join-Path $PSScriptRoot 'Dockerfile') `
     $PSScriptRoot
 if ($LASTEXITCODE -ne 0) {

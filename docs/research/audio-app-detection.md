@@ -1,5 +1,7 @@
 # Which application is that system audio from?
 
+Status: Implemented in `src/app_audio.rs` and integrated through `src/core/mod.rs` for app-name meeting title suggestions.
+
 Research + prototype for naming a new meeting after the application that is
 actually playing audio, the way the Windows volume mixer lists per-app sliders.
 
@@ -252,4 +254,3 @@ for a later phase.
   packaged — observed OK for packaged (ChatGPT), not tested for elevated.
 - `ms-resource:` manifests for WhatsApp/Store Teams resolve via
   `PackageManager`; the prototype falls back instead.
-
