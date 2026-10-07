@@ -1,5 +1,7 @@
 # FFmpeg sourcing for Sottovoce: minimal build vs. prebuilt vs. in-process
 
+Status: Minimal bundled FFmpeg and CI release packaging are implemented in `packaging/Dockerfile`, `packaging/package.ps1`, and `.github/workflows/release.yml`; the in-process replacement remains a later option.
+
 Date: 2026-10-02. Research note (Seeker), read-only investigation.
 Scope: this document only. No code changes were made.
 
@@ -188,4 +190,3 @@ the fallback if Docker becomes a blocker, accepting a much larger artifact.
 - Current crate versions/licences for opus, ogg, symphonia, rubato, and whether
   symphonia's Opus decoder is feature-complete for our ogg files.
 - Whether to keep an optional FFmpeg escape hatch for exotic imports after step 5.
-

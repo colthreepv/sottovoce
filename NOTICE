@@ -1,8 +1,6 @@
-Sottovoce started as a Windows port inspired by omarchy-meeting-recorder
-(https://github.com/jankeesvw/omarchy-meeting-recorder). The Nemotron speaker
-diarization code in src/nemotron.rs and src/diarize.rs is derived from that
-project, and the audio test fixtures in testdata/fixtures come from its bench/
-directory. Those portions are used under the following license:
+Portions of Sottovoce's Nemotron speaker diarization code and audio test
+fixtures were derived from work by Jankees van Woezik. Those portions are used
+under the following license:
 
 MIT License
 
