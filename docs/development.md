@@ -69,7 +69,8 @@ target directory rather than the repository's default `target` directory.
 ## Releases
 
 Push a `v*` tag matching the versions in the root Cargo package and Tauri
-configuration to build and publish a portable Windows x64 ZIP. GitHub Actions
+configuration to build and publish a portable Windows x64 ZIP. Pull requests
+also build the package without publishing it. GitHub Actions
 cross-builds the pinned, LGPL FFmpeg with libopus, caches that build by its
 Dockerfile and source pins, then builds and verifies the app and bundled
 FFmpeg on Windows. The release includes `sottovoce.exe`, its runtime DLLs,
