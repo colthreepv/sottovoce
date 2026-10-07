@@ -12,9 +12,27 @@
  let elapsed = $state(0);
  let mic = $state(0); let system = $state(0);
  let screen = $state<'home' | 'meeting' | 'settings'>('home');
+ let closing = $state(false); let ready = $state(false);
+ let monitoring = $state(false); let userPaused = $state(false);
+ let documentVisible = $state(true); let windowVisible = $state(false);
+ let toast = $state(''); let toastTimer: ReturnType<typeof setTimeout>;
+ let requestedMonitoring: boolean | null = null;
+ let listening = $derived(screen === 'home' && documentVisible && windowVisible && !userPaused && !closing);
+ let metersPaused = $derived(recordingState !== 'recording' && (!listening || !monitoring));
+ $effect(() => {
+   const wanted = ready && listening;
+   if (!ready) return;
+   const timer = setTimeout(() => {
+     if (requestedMonitoring !== wanted) {
+       requestedMonitoring = wanted;
+       void api.monitoring(wanted).catch(error => { requestedMonitoring = null; notice = String(error); });
+     }
+   }, 300);
+   return () => clearTimeout(timer);
+ });
  let selected = $state<string | null>(null);
  let view = $state<MeetingView | null>(null);
- let title = $state(''); let notice = $state(''); let closing = $state(false); let ready = $state(false);
+ let title = $state(''); let notice = $state('');
  let progress = $state<Record<string, {stage: string; fraction: number}>>({});
  let player = $state<Player>();
  let loadVersion = 0;
@@ -142,6 +160,8 @@
  async function handle(event: CoreEvent) {
    switch(event.type) {
      case 'levels': mic = event.mic; system = event.system; break;
+     case 'monitoring_changed': monitoring = event.active; if (!event.active) {mic = 0; system = 0;} break;
+     case 'notice': toast = event.message; clearTimeout(toastTimer); toastTimer = setTimeout(() => toast = '', 5000); break;
      case 'recording_state_changed': recordingState = event.state; elapsed = event.elapsed_ms; break;
      case 'devices_changed': devices = event.devices; break;
      case 'config_changed': applyConfig(event.config); break;
@@ -160,20 +180,26 @@
  }
  onMount(() => {
    let disposed = false; const unlisten: UnlistenFn[] = [];
+   const visibility = () => documentVisible = document.visibilityState === 'visible';
+   visibility(); document.addEventListener('visibilitychange', visibility);
    // Subscribe before the snapshot so startup and reconnect cannot lose recordingState.
    void (async () => {
      const events = await listen<CoreEvent>('core-event', e => { if (bootstrapping) pendingEvents.push(e.payload); else void action(() => handle(e.payload)); });
      if (disposed) { events(); return; } unlisten.push(events);
      const close = await listen('closing', () => { closing = true; });
      if (disposed) { close(); return; } unlisten.push(close);
+     const visible = await listen<boolean>('window-visibility', e => windowVisible = e.payload);
+     if (disposed) { visible(); return; } unlisten.push(visible);
+     windowVisible = await api.windowVisible();
      const snapshot = await api.snapshot(); if (disposed) return;
      config = snapshot.config; draft = {...snapshot.config}; devices = snapshot.devices;
+     monitoring = snapshot.monitoring;
      entries = snapshot.meetings; recordingState = snapshot.state; elapsed = snapshot.elapsed_ms; closing = snapshot.closing; ready = true;
      bootstrapping = false;
      for (const event of pendingEvents.splice(0)) await handle(event);
      await api.devices();
    })().catch(error => { bootstrapping = false; notice = String(error); });
-   return () => { disposed = true; clearTimeout(savedTimer); keyVersion++; for (const stop of unlisten) stop(); };
+   return () => { disposed = true; document.removeEventListener('visibilitychange', visibility); clearTimeout(toastTimer); clearTimeout(savedTimer); keyVersion++; for (const stop of unlisten) stop(); };
  });
 </script>
 
@@ -181,7 +207,7 @@
 <div class="shell">
  <aside>
   <button class="brand" title="Home" onclick={() => screen = 'home'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7v11h-6v-7H9v7H3Z" /></svg>Sottovoce</button>
-  <div class="rec-panel">
+  <div class="rec-panel" class:meters-paused={metersPaused}>
    <button class="record" disabled={!canRecord} onclick={() => action(recordingState === 'recording' ? api.stop : api.start)}>{recordingState === 'recording' ? '■ Stop' : recordingState === 'starting' ? 'Starting…' : recordingState === 'finalizing' ? 'Finalizing…' : '● Rec'}</button>
    <span class="timer">{clock(elapsed)}</span>
    <div class="mini"><span>Mic</span><div class="meter"><i style:width={`${meter(mic)}%`}></i></div></div>
@@ -199,12 +225,14 @@
   </nav>
   <button class="settings-link" onclick={settings}>Settings</button>
  </aside>
- <main>
+  <main>
+  {#if toast}<div class="device-toast" role="status">{toast}</div>{/if}
   {#if notice}<div class="notice" role="alert"><span>{notice}</span><button onclick={() => notice = ''}>Dismiss</button></div>{/if}
   {#if !ready}<p>Connecting to recorder…</p>
   {:else if screen === 'home'}
    <header><h1>{recordingState === 'recording' ? 'Recording' : 'Ready to record… quietly.'}</h1><p>Your microphone and system audio are saved as separate tracks.</p></header>
-   <section class="card capture">
+   <section class="card capture" class:meters-paused={metersPaused}>
+    <div class="listening-controls"><button onclick={() => userPaused = !userPaused}>{userPaused ? 'Resume listening' : 'Pause listening'}</button>{#if metersPaused}<span>Listening paused</span>{/if}</div>
     <div class="device-row"><label for="mic">Microphone</label><select id="mic" value={config?.mic_device ?? ''} disabled={recordingState !== 'ready'} onchange={e => action(() => api.mic(e.currentTarget.value || null))}>
      <option value="">Windows default</option>
      {#if config?.mic_device && !devices.inputs.some(d => d.id === config?.mic_device)}<option value={config.mic_device}>Unavailable — using default</option>{/if}

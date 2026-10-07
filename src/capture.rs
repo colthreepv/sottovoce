@@ -26,7 +26,61 @@ use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, Suppor
 use serde::{Deserialize, Serialize};
 
 use crate::devices::{self, DeviceChoice};
-use crate::types::Side;
+use crate::types::{DeviceChange, Side};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Error,
+}
+#[derive(Clone, Copy, Debug)]
+enum DeviceNoticeKind {
+    DefaultSwitched,
+    PinnedReturned,
+    PinnedMissing,
+}
+impl DeviceNoticeKind {
+    fn level(self) -> NoticeLevel {
+        match self {
+            Self::DefaultSwitched | Self::PinnedReturned => NoticeLevel::Info,
+            Self::PinnedMissing => NoticeLevel::Error,
+        }
+    }
+}
+
+/// Typed at the source; consumers never infer severity from message text.
+#[derive(Clone, Debug)]
+pub struct CaptureNotice {
+    pub level: NoticeLevel,
+    pub message: String,
+    pub change: Option<DeviceChange>,
+}
+impl CaptureNotice {
+    fn error(message: String) -> Self {
+        Self {
+            level: NoticeLevel::Error,
+            message,
+            change: None,
+        }
+    }
+    fn device(
+        kind: DeviceNoticeKind,
+        message: String,
+        side: Side,
+        device: &str,
+        at_ms: u64,
+    ) -> Self {
+        Self {
+            level: kind.level(),
+            message,
+            change: Some(DeviceChange {
+                at_ms,
+                side,
+                device: device.to_owned(),
+            }),
+        }
+    }
+}
 
 const QUEUE_PACKETS: usize = 256;
 /// Opus bitrate per (mono) track: transparent enough for speech.
@@ -60,6 +114,7 @@ pub struct Session {
     pub mic: Option<TrackInfo>,
     pub computer: Option<TrackInfo>,
     pub errors: Vec<String>,
+    pub device_changes: Vec<DeviceChange>,
 }
 
 impl Session {
@@ -108,7 +163,7 @@ struct TrackState {
     /// Set by a stream error: the supervisor reopens the device.
     reopen: Arc<AtomicBool>,
     devices: Arc<Mutex<Vec<String>>>,
-    errors: Sender<String>,
+    errors: Sender<CaptureNotice>,
 }
 
 struct Track {
@@ -169,8 +224,10 @@ pub struct Recorder {
     started: Instant,
     started_at_unix_ms: i64,
     fatal: Arc<AtomicBool>,
-    error_receiver: Receiver<String>,
+    error_receiver: Receiver<CaptureNotice>,
     errors: Vec<String>,
+    notices: Vec<CaptureNotice>,
+    device_changes: Vec<DeviceChange>,
 }
 
 /// Lightweight live level monitor. Streams and supervisors are joined on drop.
@@ -180,7 +237,7 @@ pub struct Monitor {
     mic_receiver: Receiver<Packet>,
     computer_receiver: Receiver<Packet>,
     workers: Vec<(Sender<()>, JoinHandle<()>)>,
-    error_receiver: Receiver<String>,
+    error_receiver: Receiver<CaptureNotice>,
 }
 
 impl Monitor {
@@ -207,7 +264,16 @@ impl Monitor {
         })
     }
 
-    pub fn poll_errors(&self) -> Vec<String> { self.error_receiver.try_iter().collect() }
+    pub fn poll_notices(&self) -> Vec<CaptureNotice> {
+        self.error_receiver.try_iter().collect()
+    }
+    pub fn poll_errors(&self) -> Vec<String> {
+        self.poll_notices()
+            .into_iter()
+            .filter(|n| n.level == NoticeLevel::Error)
+            .map(|n| n.message)
+            .collect()
+    }
 
     pub fn levels(&self) -> (f32, f32) {
         while self.mic_receiver.try_recv().is_ok() {}
@@ -234,7 +300,7 @@ fn stop_monitor_worker(worker: (Sender<()>, JoinHandle<()>)) {
 fn start_monitor_track(
     side: Side,
     started: Instant,
-    errors: Sender<String>,
+    errors: Sender<CaptureNotice>,
     choice: DeviceChoice,
 ) -> Result<(TrackState, Receiver<Packet>, (Sender<()>, JoinHandle<()>)), String> {
     let (_, config, _, _) = resolve_device(side, &choice)?;
@@ -339,6 +405,8 @@ impl Recorder {
             fatal,
             error_receiver,
             errors: Vec::new(),
+            notices: Vec::new(),
+            device_changes: Vec::new(),
         })
     }
 
@@ -383,9 +451,23 @@ impl Recorder {
     /// fatal, which means the recording should be stopped.
     pub fn poll_errors(&mut self) -> (&[String], bool) {
         while let Ok(error) = self.error_receiver.try_recv() {
-            self.errors.push(error);
+            if error.level == NoticeLevel::Error {
+                self.errors.push(error.message.clone());
+            }
+            if let Some(change) = &error.change {
+                self.device_changes.push(change.clone());
+            }
+            self.notices.push(error);
         }
         (&self.errors, self.fatal.load(Ordering::Relaxed))
+    }
+
+    pub fn poll_notices(&mut self) -> (Vec<CaptureNotice>, bool) {
+        self.poll_errors();
+        (
+            std::mem::take(&mut self.notices),
+            self.fatal.load(Ordering::Relaxed),
+        )
     }
 
     /// Stops both tracks, finalizes the files and writes session.json.
@@ -401,7 +483,12 @@ impl Recorder {
             .map_err(|e| errors.push(e))
             .ok();
         while let Ok(error) = self.error_receiver.try_recv() {
-            errors.push(error);
+            if error.level == NoticeLevel::Error {
+                errors.push(error.message);
+            }
+            if let Some(change) = error.change {
+                self.device_changes.push(change);
+            }
         }
         let failed = self.fatal.load(Ordering::Relaxed) || mic.is_none() || computer.is_none();
         let session = Session {
@@ -411,6 +498,7 @@ impl Recorder {
             mic,
             computer,
             errors,
+            device_changes: self.device_changes,
         };
         session.save(&self.dir)?;
         Ok(session)
@@ -520,7 +608,7 @@ fn start_track(
     dir: &Path,
     started: Instant,
     fatal: Arc<AtomicBool>,
-    errors: Sender<String>,
+    errors: Sender<CaptureNotice>,
     choice: DeviceChoice,
 ) -> Result<Track, String> {
     let (_, config, _, _) = resolve_device(side, &choice)?;
@@ -600,10 +688,17 @@ fn supervise(
             let name = devices::find(id)
                 .and_then(|d| d.description().ok().map(|d| d.name().to_owned()))
                 .unwrap_or_else(|| id.clone());
-            let _ = state.errors.send(format!(
-                "{} {name} not available, recording Windows default {}",
-                device_label(state.side),
-                device_name(current.as_ref().map_or("", |(key, _)| key))
+            let device = device_name(current.as_ref().map_or("", |(key, _)| key));
+            let _ = state.errors.send(CaptureNotice::device(
+                DeviceNoticeKind::PinnedMissing,
+                format!(
+                    "{} {name} not available, using Windows default {}",
+                    device_label(state.side),
+                    device
+                ),
+                state.side,
+                device,
+                state.started.elapsed().as_millis() as u64,
             ));
         }
     }
@@ -618,7 +713,7 @@ fn supervise(
         let changed = match (&wanted, &current) {
             (Ok((_, _, key, _)), Some((current_key, _))) => key != current_key,
             (Ok(_), None) => true,
-            (Err(_), _) => false,
+            (Err(_), _) => true,
         };
         if !reopen && !changed {
             continue;
@@ -633,24 +728,40 @@ fn supervise(
                 if key != previous_key {
                     if let DeviceChoice::Pinned(id) = &choice {
                         if wanted_pinned {
-                            let _ = state.errors.send(format!(
-                                "{label}: pinned device {} is available again",
-                                device_name(&key)
+                            let _ = state.errors.send(CaptureNotice::device(
+                                DeviceNoticeKind::PinnedReturned,
+                                format!(
+                                    "{label}: pinned device {} is available again",
+                                    device_name(&key)
+                                ),
+                                state.side,
+                                device_name(&key),
+                                state.started.elapsed().as_millis() as u64,
                             ));
                         } else if pinned {
                             let name = devices::find(id)
                                 .and_then(|d| d.description().ok().map(|d| d.name().to_owned()))
                                 .unwrap_or_else(|| id.clone());
-                            let _ = state.errors.send(format!(
-                                "{} {name} not available, recording Windows default {}",
-                                device_label(state.side),
-                                device_name(&key)
+                            let _ = state.errors.send(CaptureNotice::device(
+                                DeviceNoticeKind::PinnedMissing,
+                                format!(
+                                    "{} {name} not available, using Windows default {}",
+                                    device_label(state.side),
+                                    device_name(&key)
+                                ),
+                                state.side,
+                                device_name(&key),
+                                state.started.elapsed().as_millis() as u64,
                             ));
                         }
                     } else {
-                        let _ = state
-                            .errors
-                            .send(format!("{label}: now recording {}", device_name(&key)));
+                        let _ = state.errors.send(CaptureNotice::device(
+                            DeviceNoticeKind::DefaultSwitched,
+                            format!("{label}: device switched to {}", device_name(&key)),
+                            state.side,
+                            device_name(&key),
+                            state.started.elapsed().as_millis() as u64,
+                        ));
                     }
                 }
                 push_device(&state, &key);
@@ -662,7 +773,9 @@ fn supervise(
                 // Keep trying; give up after a minute without any device.
                 let since = *failing_since.get_or_insert_with(Instant::now);
                 if since.elapsed() > Duration::from_secs(60) {
-                    let _ = state.errors.send(format!("{label}: {e}"));
+                    let _ = state
+                        .errors
+                        .send(CaptureNotice::error(format!("{label}: {e}")));
                     fatal.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -882,7 +995,9 @@ where
                 if error.kind() == cpal::ErrorKind::Xrun {
                     s.xruns.fetch_add(1, Ordering::Relaxed);
                 } else if !s.reopen.swap(true, Ordering::Relaxed) {
-                    let _ = s.errors.send(format!("{}: {error}", s.side.label()));
+                    let _ = s
+                        .errors
+                        .send(CaptureNotice::error(format!("{}: {error}", s.side.label())));
                 }
             },
             None,
@@ -915,6 +1030,18 @@ fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_notice_classification_is_explicit() {
+        assert_eq!(DeviceNoticeKind::DefaultSwitched.level(), NoticeLevel::Info);
+        assert_eq!(DeviceNoticeKind::PinnedReturned.level(), NoticeLevel::Info);
+        assert_eq!(DeviceNoticeKind::PinnedMissing.level(), NoticeLevel::Error);
+        assert_eq!(
+            CaptureNotice::error("fatal".into()).level,
+            NoticeLevel::Error
+        );
+        let legacy: Session = serde_json::from_str(r#"{"status":"completed"}"#).unwrap();
+        assert!(legacy.device_changes.is_empty());
+    }
 
     #[test]
     fn resampling_keeps_the_duration() {

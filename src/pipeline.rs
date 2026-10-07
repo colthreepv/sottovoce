@@ -130,6 +130,11 @@ pub fn process(
         duration_ms,
         language,
         source_app: previous.as_ref().and_then(|m| m.source_app.clone()),
+        device_changes: previous
+            .as_ref()
+            .filter(|m| !m.device_changes.is_empty())
+            .map(|m| m.device_changes.clone())
+            .unwrap_or_else(|| session.device_changes.clone()),
         stt_model: options.stt.model_id.clone(),
         speakers,
         utterances,
@@ -188,6 +193,67 @@ fn preserve_speaker_names(
 mod tests {
     use super::*;
     use crate::types::{Side, Speaker, Utterance};
+    #[test]
+    fn device_history_roundtrips_and_survives_retranscription() {
+        use crate::types::DeviceChange;
+        use std::sync::{Arc, atomic::AtomicBool, mpsc};
+        let root = std::env::temp_dir().join(format!(
+            "sottovoce-device-history-{}-{}",
+            std::process::id(),
+            crate::capture::unix_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let change = DeviceChange {
+            at_ms: 1234,
+            side: Side::Computer,
+            device: "Headset".into(),
+        };
+        let legacy: Meeting = serde_json::from_str(r#"{"title":"Legacy meeting"}"#).unwrap();
+        assert!(legacy.device_changes.is_empty());
+        let original = Meeting {
+            device_changes: vec![change.clone()],
+            ..legacy
+        };
+        crate::meetings::save(&root, &original).unwrap();
+        assert_eq!(
+            crate::meetings::load(&root).unwrap().device_changes,
+            vec![change.clone()]
+        );
+        let options = Options {
+            stt: SttOptions {
+                api_key: "unused-offline-key".into(),
+                model_id: "scribe_v2".into(),
+                language: None,
+            },
+            diarize: false,
+            your_name: None,
+        };
+        let (events, _) = mpsc::channel();
+        let abort = Arc::new(AtomicBool::new(false));
+        // No audio files: exercise metadata rebuilding without hardware or API calls.
+        for _ in 0..2 {
+            let rebuilt = process(&root, &options, &events, &abort).unwrap();
+            assert_eq!(rebuilt.device_changes, original.device_changes);
+            assert_eq!(
+                crate::meetings::load(&root).unwrap().device_changes,
+                original.device_changes
+            );
+        }
+        crate::capture::Session {
+            device_changes: vec![change.clone()],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        crate::meetings::save(&root, &Meeting::default()).unwrap();
+        assert_eq!(
+            process(&root, &options, &events, &abort)
+                .unwrap()
+                .device_changes,
+            vec![change]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn preserves_custom_names_after_renumbering_but_refreshes_default_labels() {
         let utterance = |speaker: &str| Utterance {

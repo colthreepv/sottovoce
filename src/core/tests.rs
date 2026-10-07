@@ -7,9 +7,13 @@ struct FakeCapture {
     fail_start: bool,
     fail_stop: bool,
     stops: Arc<AtomicUsize>,
+    monitors: Arc<AtomicUsize>,
+    levels: Arc<AtomicUsize>,
+    notices: Arc<Mutex<Vec<crate::capture::CaptureNotice>>>,
 }
 impl Capture for FakeCapture {
     fn monitor(&mut self, _: &Config) -> Result<(), String> {
+        self.monitors.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn stop_monitor(&mut self) {}
@@ -42,7 +46,11 @@ impl Capture for FakeCapture {
         Ok(session)
     }
     fn levels(&mut self) -> (f32, f32) {
+        self.levels.fetch_add(1, Ordering::SeqCst);
         (0.1, 0.2)
+    }
+    fn notices(&mut self) -> (Vec<crate::capture::CaptureNotice>, bool) {
+        (std::mem::take(&mut *self.notices.lock().unwrap()), false)
     }
 }
 struct FakeProcessor {
@@ -88,6 +96,9 @@ struct Harness {
     release: Sender<()>,
     root: PathBuf,
     stops: Arc<AtomicUsize>,
+    monitors: Arc<AtomicUsize>,
+    levels: Arc<AtomicUsize>,
+    notices: Arc<Mutex<Vec<crate::capture::CaptureNotice>>>,
 }
 impl Harness {
     fn new(fail_start: bool, fail_stop: bool, fail_job: bool) -> Self {
@@ -109,6 +120,12 @@ impl Harness {
         let (release, rx) = mpsc::channel();
         let stops = Arc::new(AtomicUsize::new(0));
         let captured = stops.clone();
+        let monitors = Arc::new(AtomicUsize::new(0));
+        let captured_monitors = monitors.clone();
+        let levels = Arc::new(AtomicUsize::new(0));
+        let captured_levels = levels.clone();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let captured_notices = notices.clone();
         let (core, events) = Core::with_backends(
             root.join("config.toml"),
             move || {
@@ -118,6 +135,9 @@ impl Harness {
                     fail_start,
                     fail_stop,
                     stops: captured,
+                    monitors: captured_monitors,
+                    levels: captured_levels,
+                    notices: captured_notices,
                 })
             },
             Arc::new(FakeProcessor {
@@ -134,6 +154,9 @@ impl Harness {
             release,
             root,
             stops,
+            monitors,
+            levels,
+            notices,
         };
         h.wait(|e| {
             matches!(
@@ -229,6 +252,7 @@ fn library_busy_meetings_refuse_rename_transcription_and_second_operation() {
     let mut actor = Actor {
         path: h.root.join("config.toml"),
         snapshot: Arc::new(Mutex::new(Snapshot {
+            monitoring: false,
             config: h.core.get_config(),
             state: RecordingState::Ready,
             jobs: BTreeMap::new(),
@@ -245,6 +269,8 @@ fn library_busy_meetings_refuse_rename_transcription_and_second_operation() {
         queue: VecDeque::new(),
         running: None,
         library_busy: std::collections::BTreeSet::new(),
+        monitoring_wanted: false,
+        device_changes: Vec::new(),
     };
     actor
         .begin_library(dir.clone(), crate::library::Action::Archive)
@@ -479,6 +505,9 @@ fn shutdown_during_start_finalizes_before_acknowledging() {
                     fail_start: false,
                     fail_stop: false,
                     stops: worker_stops,
+                    monitors: Arc::new(AtomicUsize::new(0)),
+                    levels: Arc::new(AtomicUsize::new(0)),
+                    notices: Arc::new(Mutex::new(Vec::new())),
                 },
                 entered: entered_tx,
                 release: release_rx,
@@ -511,4 +540,176 @@ fn shutdown_during_start_finalizes_before_acknowledging() {
     assert_eq!(core.recording_state(), RecordingState::Ready);
     core.worker.take().unwrap().join().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn paused_capture_skips_monitor_levels_and_device_reopens() {
+    let h = Harness::new(false, false, false);
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: false }));
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 0);
+    h.core.set_mic_device(Some("other".into())).unwrap();
+    h.wait(|e| matches!(e, Event::ConfigChanged {config} if config.mic_device.as_deref() == Some("other")));
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 0);
+    let dir = h.recording();
+    h.stop();
+    assert!(crate::meetings::load(&dir).is_some());
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 0);
+    assert_eq!(h.levels.load(Ordering::SeqCst), 0);
+    h.core.set_monitoring(true).unwrap();
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: true }));
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 1);
+    h.recording();
+    h.stop();
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: true }));
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 2);
+    h.core.set_monitoring(false).unwrap();
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: false }));
+    let polls = h.levels.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(220));
+    assert_eq!(h.levels.load(Ordering::SeqCst), polls);
+    h.close();
+}
+
+#[test]
+fn monitoring_wanted_during_recording_resumes_only_after_stop() {
+    let h = Harness::new(false, false, false);
+    h.recording();
+    h.core.set_monitoring(true).unwrap();
+    h.core.list_devices().unwrap();
+    h.wait(|e| matches!(e, Event::DevicesChanged { .. }));
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 0);
+    h.stop();
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: true }));
+    h.recording();
+    h.core.set_monitoring(false).unwrap();
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: false }));
+    h.stop();
+    assert_eq!(h.monitors.load(Ordering::SeqCst), 1);
+    h.close();
+}
+
+#[test]
+fn device_info_is_silent_on_monitor_and_recorded_with_offsets() {
+    use crate::capture::{CaptureNotice, NoticeLevel};
+    use crate::types::{DeviceChange, Side};
+    let h = Harness::new(false, false, false);
+    h.core.set_monitoring(true).unwrap();
+    h.wait(|e| matches!(e, Event::MonitoringChanged { active: true }));
+    h.notices.lock().unwrap().push(CaptureNotice {
+        level: NoticeLevel::Info,
+        message: "monitor switched".into(),
+        change: None,
+    });
+    h.wait(|e| matches!(e, Event::Levels {mic,..} if *mic > 0.0));
+    assert!(
+        !h.events
+            .try_iter()
+            .any(|e| matches!(e, Event::Notice { .. } | Event::Error { .. }))
+    );
+    let dir = h.recording();
+    let change = DeviceChange {
+        at_ms: 42,
+        side: Side::Computer,
+        device: "Headset".into(),
+    };
+    h.notices.lock().unwrap().push(CaptureNotice {
+        level: NoticeLevel::Info,
+        message: "recording switched".into(),
+        change: Some(change.clone()),
+    });
+    h.wait(|e| matches!(e, Event::Notice {message} if message == "recording switched"));
+    h.notices.lock().unwrap().push(CaptureNotice {
+        level: NoticeLevel::Error,
+        message: "missing pinned".into(),
+        change: None,
+    });
+    h.wait(|e| matches!(e, Event::Error {message} if message == "missing pinned"));
+    h.stop();
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("meeting.json")).unwrap()).unwrap();
+    assert_eq!(
+        json["device_changes"],
+        serde_json::to_value(vec![change.clone()]).unwrap()
+    );
+    let metadata = crate::meetings::load(&dir).unwrap();
+    assert_eq!(metadata.device_changes, vec![change.clone()]);
+    crate::meetings::save(&dir, &metadata).unwrap();
+    assert_eq!(
+        crate::meetings::load(&dir).unwrap().device_changes,
+        vec![change]
+    );
+    h.close();
+}
+
+#[test]
+#[ignore = "Uses real input/loopback monitoring only; never records or plays audio"]
+#[cfg(windows)]
+fn monitoring_cpu_probe() {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessTimes(
+            process: *mut std::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    fn cpu() -> f64 {
+        let mut times: [FileTime; 4] = std::array::from_fn(|_| FileTime { low: 0, high: 0 });
+        let [creation, exit, kernel, user] = &mut times;
+        assert_ne!(
+            unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) },
+            0
+        );
+        let ticks = |t: &FileTime| ((t.high as u64) << 32) | t.low as u64;
+        (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0
+    }
+    let h = Harness::new(false, false, false);
+    h.close();
+    let (core, events) = Core::with_backends(
+        h.root.join("config.toml"),
+        || {
+            crate::audio_thread_init();
+            Box::new(AudioCapture {
+                recorder: None,
+                monitor: None,
+                reported: 0,
+                app: None,
+            })
+        },
+        Arc::new(Pipeline),
+    )
+    .unwrap();
+    for active in [false, true, false] {
+        core.set_monitoring(active).unwrap();
+        loop {
+            match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Event::MonitoringChanged { active: actual } if actual == active => break,
+                Event::Error { message } => panic!("monitor probe: {message}"),
+                _ => (),
+            }
+        }
+        // Let the streams settle, then measure CPU of this process, not the user's app.
+        std::thread::sleep(Duration::from_millis(500));
+        let started = Instant::now();
+        let before = cpu();
+        std::thread::sleep(Duration::from_secs(5));
+        println!(
+            "MONITOR_CPU active={active} process_cpu_percent={:.3}",
+            100.0 * (cpu() - before) / started.elapsed().as_secs_f64()
+        );
+    }
+    core.shutdown().unwrap();
+    while !matches!(
+        events.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Event::ShutdownComplete
+    ) {}
+    drop(core);
 }

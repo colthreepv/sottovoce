@@ -24,6 +24,7 @@ struct Snapshot {
     elapsed_ms: u64,
     recording_meeting: Option<PathBuf>,
     closing: bool,
+    monitoring: bool,
     meetings: Vec<MeetingEntry>,
 }
 struct Engine {
@@ -42,6 +43,18 @@ fn start_recording(state: State<Engine>) -> Result<(), String> {
 #[tauri::command]
 fn stop_recording(state: State<Engine>) -> Result<(), String> {
     lock_core(&state)?.stop_recording()
+}
+#[tauri::command]
+fn set_monitoring(active: bool, state: State<Engine>) -> Result<(), String> {
+    lock_core(&state)?.set_monitoring(active)
+}
+#[tauri::command]
+fn get_window_visibility(app: tauri::AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Main window unavailable")?;
+    Ok(window.is_visible().map_err(|e| e.to_string())?
+        && !window.is_minimized().map_err(|e| e.to_string())?)
 }
 #[tauri::command]
 fn transcribe(meeting: PathBuf, state: State<Engine>) -> Result<(), String> {
@@ -132,6 +145,7 @@ fn get_snapshot(state: State<Engine>) -> Result<Snapshot, String> {
     snapshot.meetings = core.list_meetings();
     snapshot.state = core.recording_state();
     snapshot.closing = state.closing.load(Ordering::SeqCst);
+    snapshot.monitoring = core.monitoring();
     Ok(snapshot)
 }
 // Validate at the file boundary and grant only the selected audio files to the
@@ -232,6 +246,7 @@ fn main() {
                 elapsed_ms: 0,
                 recording_meeting: None,
                 closing: false,
+                monitoring: core.monitoring(),
                 meetings: vec![],
             };
             app.manage(Engine {
@@ -261,6 +276,7 @@ fn main() {
                                     latest.recording_meeting = meeting.clone();
                                 }
                                 Event::ConfigChanged { config } => latest.config = config.clone(),
+                                Event::MonitoringChanged { active } => latest.monitoring = *active,
                                 _ => (),
                             }
                         }
@@ -283,6 +299,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
+            set_monitoring,
+            get_window_visibility,
             transcribe,
             cancel_job,
             list_meetings,
@@ -301,6 +319,14 @@ fn main() {
             get_meeting
         ])
         .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Focused(_) | tauri::WindowEvent::Resized(_)
+            ) {
+                let visible =
+                    window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true);
+                let _ = window.emit("window-visibility", visible);
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if let Err(error) = begin_shutdown(window.app_handle()) {
@@ -395,6 +421,7 @@ mod tests {
             elapsed_ms: 0,
             recording_meeting: None,
             closing: false,
+            monitoring: false,
             meetings: vec![],
         };
         let json = serde_json::to_value(snapshot).unwrap();

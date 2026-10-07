@@ -74,6 +74,12 @@ pub enum Event {
         mic: f32,
         system: f32,
     },
+    MonitoringChanged {
+        active: bool,
+    },
+    Notice {
+        message: String,
+    },
     RecordingStateChanged {
         state: RecordingState,
         elapsed_ms: u64,
@@ -127,6 +133,20 @@ pub trait Capture {
     fn levels(&mut self) -> (f32, f32);
     fn errors(&mut self) -> (Vec<String>, bool) {
         (vec![], false)
+    }
+    fn notices(&mut self) -> (Vec<crate::capture::CaptureNotice>, bool) {
+        let (errors, fatal) = self.errors();
+        (
+            errors
+                .into_iter()
+                .map(|message| crate::capture::CaptureNotice {
+                    level: crate::capture::NoticeLevel::Error,
+                    message,
+                    change: None,
+                })
+                .collect(),
+            fatal,
+        )
     }
     fn devices(&mut self) -> Result<Devices, String> {
         Ok(Devices::default())
@@ -213,6 +233,19 @@ impl Capture for AudioCapture {
         self.reported = errors.len();
         (fresh, fatal)
     }
+    fn notices(&mut self) -> (Vec<crate::capture::CaptureNotice>, bool) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.poll_notices()
+        } else {
+            (
+                self.monitor
+                    .as_ref()
+                    .map(|m| m.poll_notices())
+                    .unwrap_or_default(),
+                false,
+            )
+        }
+    }
     fn devices(&mut self) -> Result<Devices, String> {
         Ok(Devices {
             inputs: crate::devices::inputs()?,
@@ -242,8 +275,10 @@ struct Snapshot {
     state: RecordingState,
     jobs: BTreeMap<PathBuf, JobState>,
     devices: Devices,
+    monitoring: bool,
 }
 enum Command {
+    Monitoring(bool),
     Start,
     Stop,
     Transcribe(PathBuf),
@@ -255,7 +290,11 @@ enum Command {
     Rename(PathBuf, String, Sender<Result<PathBuf, String>>),
     DeleteAudio(PathBuf),
     ArchiveMeeting(PathBuf),
-    LibraryFinished(PathBuf, crate::library::Action, Result<Option<PathBuf>, String>),
+    LibraryFinished(
+        PathBuf,
+        crate::library::Action,
+        Result<Option<PathBuf>, String>,
+    ),
     Shutdown,
 }
 struct Work {
@@ -263,8 +302,8 @@ struct Work {
     config: Config,
     abort: Abort,
 }
-/// Own this handle for the frontend lifetime. Drain events continuously (levels
-/// arrive at 12.5 Hz). shutdown is idempotent; wait for ShutdownComplete before
+/// Monitoring starts paused. Opt in with set_monitoring(true); levels arrive at
+/// 12.5 Hz while wanted. shutdown is idempotent; wait for ShutdownComplete before
 /// closing. A cancelled blocking HTTP request does not delay audio shutdown.
 pub struct Core {
     commands: Sender<Command>,
@@ -312,6 +351,7 @@ impl Core {
             state: RecordingState::Ready,
             jobs: BTreeMap::new(),
             devices: Devices::default(),
+            monitoring: false,
         }));
         let closing = Arc::new(AtomicBool::new(false));
         let aborts = Arc::new(Mutex::new(BTreeMap::new()));
@@ -337,6 +377,8 @@ impl Core {
                     queue: VecDeque::new(),
                     running: None,
                     library_busy: std::collections::BTreeSet::new(),
+                    monitoring_wanted: false,
+                    device_changes: Vec::new(),
                 };
                 let _ = ready_tx.send(());
                 let result =
@@ -372,6 +414,12 @@ impl Core {
     }
     pub fn start_recording(&self) -> Result<(), String> {
         self.send(Command::Start)
+    }
+    pub fn set_monitoring(&self, active: bool) -> Result<(), String> {
+        self.send(Command::Monitoring(active))
+    }
+    pub fn monitoring(&self) -> bool {
+        self.snapshot.lock().unwrap().monitoring
     }
     pub fn stop_recording(&self) -> Result<(), String> {
         self.send(Command::Stop)
@@ -470,6 +518,8 @@ struct Actor {
     queue: VecDeque<Work>,
     running: Option<Running>,
     library_busy: std::collections::BTreeSet<PathBuf>,
+    monitoring_wanted: bool,
+    device_changes: Vec<crate::types::DeviceChange>,
 }
 impl Actor {
     fn emit(&self, event: Event) {
@@ -485,6 +535,9 @@ impl Actor {
     }
     fn state(&self) -> RecordingState {
         self.snapshot.lock().unwrap().state
+    }
+    fn monitoring(&self) -> bool {
+        self.snapshot.lock().unwrap().monitoring
     }
     fn audio(&mut self) -> &mut dyn Capture {
         self.capture.as_mut().unwrap().as_mut()
@@ -509,10 +562,56 @@ impl Actor {
         Ok(())
     }
     fn monitor(&mut self) {
-        let config = self.config();
-        if let Err(e) = self.audio().monitor(&config) {
-            self.error(e);
+        if !self.monitoring_wanted || self.state() != RecordingState::Ready {
+            return;
         }
+        let config = self.config();
+        match self.audio().monitor(&config) {
+            Ok(()) => self.monitoring_event(true),
+            Err(e) => {
+                self.monitoring_event(false);
+                self.error(e);
+            }
+        }
+    }
+    fn monitoring_event(&self, active: bool) {
+        self.snapshot.lock().unwrap().monitoring = active;
+        self.emit(Event::MonitoringChanged { active });
+        if !active {
+            self.emit(Event::Levels {
+                mic: 0.0,
+                system: 0.0,
+            });
+        }
+    }
+    fn set_monitoring(&mut self, active: bool) {
+        self.monitoring_wanted = active;
+        if !active {
+            self.audio().stop_monitor();
+            self.monitoring_event(false);
+        } else if self.state() == RecordingState::Ready && !self.monitoring() {
+            self.monitor();
+        }
+    }
+    fn poll_notices(&mut self) -> bool {
+        let (notices, fatal) = self.audio().notices();
+        for notice in notices {
+            if self.state() == RecordingState::Recording {
+                if let Some(change) = notice.change {
+                    self.device_changes.push(change);
+                }
+                if notice.level == crate::capture::NoticeLevel::Info {
+                    self.emit(Event::Notice {
+                        message: notice.message,
+                    });
+                    continue;
+                }
+            }
+            if notice.level == crate::capture::NoticeLevel::Error {
+                self.error(notice.message);
+            }
+        }
+        fatal
     }
     fn scan(&mut self) {
         match self.audio().devices() {
@@ -585,7 +684,11 @@ impl Actor {
         }
         crate::meetings::rename(&dir, title)
     }
-    fn begin_library(&mut self, dir: PathBuf, action: crate::library::Action) -> Result<(), String> {
+    fn begin_library(
+        &mut self,
+        dir: PathBuf,
+        action: crate::library::Action,
+    ) -> Result<(), String> {
         if self.dir.as_ref() == Some(&dir) {
             return Err("Cannot delete or archive a recording in progress".into());
         }
@@ -752,6 +855,8 @@ impl Actor {
     fn start(&mut self) -> Result<(), String> {
         self.transition(RecordingState::Starting)?;
         self.audio().stop_monitor();
+        self.monitoring_event(false);
+        self.device_changes.clear();
         let config = self.config();
         let dir = crate::meetings::new_dir(&config.meetings_dir(), crate::capture::unix_ms());
         match self.audio().start(&dir, &config) {
@@ -779,6 +884,7 @@ impl Actor {
     }
     fn stop(&mut self) -> Result<(), String> {
         let dir = self.dir.clone().ok_or("No recording directory")?;
+        self.poll_notices();
         self.transition(RecordingState::Finalizing)?;
         let source_app = self.audio().source_app();
         let result = self.audio().stop().and_then(|session| {
@@ -796,6 +902,11 @@ impl Actor {
                     source_app: source_app.clone(),
                     started_at_unix_ms: session.started_at_unix_ms,
                     duration_ms: duration,
+                    device_changes: if session.device_changes.is_empty() {
+                        self.device_changes.clone()
+                    } else {
+                        session.device_changes.clone()
+                    },
                     ..Default::default()
                 },
             )?;
@@ -829,7 +940,7 @@ impl Actor {
         });
         self.state_event();
         self.scan();
-        self.monitor();
+        self.monitoring_event(false);
         let mut levels_at = Instant::now();
         let mut poll = Instant::now();
         let mut app_at = Instant::now();
@@ -837,12 +948,23 @@ impl Actor {
             if self.closing.load(Ordering::SeqCst) {
                 break;
             }
-            match commands.recv_timeout(Duration::from_millis(80)) {
+            let active = self.monitoring()
+                || self.state() == RecordingState::Recording
+                || self.running.is_some();
+            match commands.recv_timeout(if active {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_secs(1)
+            }) {
                 Ok(command) => {
                     if self.closing.load(Ordering::SeqCst) {
                         break;
                     }
                     let result = match command {
+                        Command::Monitoring(active) => {
+                            self.set_monitoring(active);
+                            Ok(())
+                        }
                         Command::Start => self.start(),
                         Command::Stop => self.stop(),
                         Command::Transcribe(dir) => self.enqueue(dir),
@@ -930,8 +1052,12 @@ impl Actor {
                 }
                 Err(_) => (),
             }
-            if levels_at.elapsed() >= Duration::from_millis(80) {
+            if (self.monitoring() || self.state() == RecordingState::Recording)
+                && levels_at.elapsed() >= Duration::from_millis(80)
+            {
                 levels_at = Instant::now();
+                // While recording, levels come from the recorder's own streams,
+                // so the sidebar meters work from any screen at no extra cost.
                 let (mic, system) = self.audio().levels();
                 self.emit(Event::Levels { mic, system });
                 if self.state() == RecordingState::Recording {
@@ -945,10 +1071,11 @@ impl Actor {
                     self.audio().sample_app_audio(&config);
                 }
             }
-            let (errors, fatal) = self.audio().errors();
-            for e in errors {
-                self.error(e);
-            }
+            let fatal = if self.monitoring() || self.state() == RecordingState::Recording {
+                self.poll_notices()
+            } else {
+                false
+            };
             if fatal && self.state() == RecordingState::Recording {
                 if let Err(e) = self.stop() {
                     self.error(e);
@@ -978,6 +1105,7 @@ impl Actor {
             }
         }
         self.audio().stop_monitor();
+        self.monitoring_event(false);
         while let Some(work) = self.queue.pop_front() {
             work.abort.store(true, Ordering::SeqCst);
             self.terminal(work.dir, Err(crate::types::CANCELLED.into()));

@@ -12,10 +12,13 @@ export interface Entry { dir: string; title: string; started_at_unix_ms: number;
 export interface MeetingEntry { meeting: Entry; job: JobState | null }
 export interface Speaker { id: string; side: 'mic' | 'computer'; name: string }
 export interface Utterance { speaker: string; side: 'mic' | 'computer'; start_ms: number; end_ms: number; text: string }
-export interface Meeting { title: string; source_app: string | null; started_at_unix_ms: number; duration_ms: number; language: string | null; stt_model: string; speakers: Speaker[]; utterances: Utterance[] }
+export interface DeviceChange { at_ms: number; side: 'mic' | 'computer'; device: string }
+export interface Meeting { title: string; source_app: string | null; started_at_unix_ms: number; duration_ms: number; language: string | null; stt_model: string; speakers: Speaker[]; utterances: Utterance[]; device_changes: DeviceChange[] }
 export interface MeetingView { meeting: Meeting; mic: string | null; system: string | null }
-export interface Snapshot { config: Config; devices: Devices; state: RecordingState; elapsed_ms: number; recording_meeting: string | null; closing: boolean; meetings: MeetingEntry[] }
+export interface Snapshot { config: Config; devices: Devices; state: RecordingState; elapsed_ms: number; recording_meeting: string | null; closing: boolean; monitoring: boolean; meetings: MeetingEntry[] }
 export type CoreEvent =
+ | { type: 'monitoring_changed'; active: boolean }
+ | { type: 'notice'; message: string }
  | { type: 'levels'; mic: number; system: number }
  | { type: 'recording_state_changed'; state: RecordingState; elapsed_ms: number; meeting: string | null }
  | { type: 'job_queued' | 'job_done' | 'job_cancelled'; meeting: string }
@@ -28,6 +31,8 @@ export type CoreEvent =
  | { type: 'config_changed'; config: Config }
  | { type: 'error'; message: string };
 export const api = {
+ monitoring: (active: boolean) => invoke<void>('set_monitoring', {active}),
+ windowVisible: () => invoke<boolean>('get_window_visibility'),
  getConfig: () => invoke<Config>('get_config'),
  testKey: (key: string | null) => invoke<void>('test_api_key', {key}),
  folderDefaults: () => invoke<Record<'meetings_dir' | 'transcripts_dir' | 'archive_dir', string>>('get_folder_defaults'),

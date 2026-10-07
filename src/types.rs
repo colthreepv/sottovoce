@@ -91,9 +91,17 @@ pub struct Utterance {
     pub text: String,
 }
 
-/// meeting.json in a meeting folder.
+/// A device change relative to the beginning of capture.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceChange {
+    pub at_ms: u64,
+    pub side: Side,
+    pub device: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
+/// meeting.json in a meeting folder.
 pub struct Meeting {
     pub title: String,
     /// Friendly name of the app that produced the most system audio during the
@@ -106,6 +114,9 @@ pub struct Meeting {
     pub stt_model: String,
     pub speakers: Vec<Speaker>,
     pub utterances: Vec<Utterance>,
+    /// Device switches and fallbacks relative to the start of capture.
+    #[serde(default)]
+    pub device_changes: Vec<DeviceChange>,
 }
 
 impl Meeting {
