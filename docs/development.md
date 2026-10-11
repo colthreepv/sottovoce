@@ -32,16 +32,16 @@ By default, the newest three builds are kept in
 Cargo version and short Git commit, with `-dirty` when the working tree has
 changes. A numeric suffix is added if that name already exists. Each directory
 contains `build.json` with the version, full commit, dirty flag, UTC build
-time, and Rust/Cargo versions. The helper stages `sottovoce.exe` and
-copies `packaging\dist\ffmpeg.exe` when that file exists. The development-only
-`sottovoce-dev-cli.exe` is not deployed. The artifact list is
-defined near the top of `scripts\deploy-latest.ps1` and can be updated when
-the executable layout changes.
+time, and Rust/Cargo versions. Local deployment assembles the same portable
+layout as CI through `packaging\package.ps1`; if
+`packaging\dist\ffmpeg.exe` is missing, it warns and packages without FFmpeg.
+The development-only `sottovoce-dev-cli.exe` is not deployed.
 
 The `latest` path is a junction. Deployment refuses to replace it if it is not
-a junction to a managed Sottovoce build. Old builds are pruned after the
-junction switches; builds whose executable is currently running are retained,
-and the helper never stops a process.
+a junction to a Sottovoce executable inside the build root. An unmanaged prior
+folder without `build.json` can be replaced and is left untouched; only managed
+folders are eligible for pruning. Builds whose executable is currently running
+are retained, and the helper never stops a process.
 
 A real deployment (no `-BuildRoot`) also keeps a `Sottovoce` Start Menu
 shortcut pointing to `latest\sottovoce.exe`, so the Start Menu always opens the
@@ -54,14 +54,27 @@ pass a temporary `-BuildRoot`, and use a temporary
 `SOTTOVOCE_CONFIG_DIR` when launching the app. Do not run tests that
 record or play audio.
 
-The helper accepts `-BuildRoot`, `-KeepBuilds`, and `-SkipBuild`. Use
-`-SkipBuild` only when the release executable already exists in the helper's
-dedicated `%TEMP%\sottovoce-deploy-target\release` directory:
+The helper accepts `-FromRelease`, `-BuildRoot`, `-KeepBuilds`, and `-SkipBuild`.
+Deploy an already-published portable release without building locally:
+
+```powershell
+.\scripts\deploy-latest.ps1 -FromRelease v0.2.0
+```
+
+The release mode downloads the versioned ZIP and `SHA256SUMS`, verifies the
+archive, and records its tag commit in `build.json`. It does not run Cargo or
+Bun. Use `-SkipBuild` only when the release executable and DirectML runtime DLL
+already exist in the helper's dedicated
+`%TEMP%\sottovoce-deploy-target\release` directory:
 
 ```powershell
 .\scripts\deploy-latest.ps1 -BuildRoot "$env:TEMP\sottovoce-builds" -KeepBuilds 5
 .\scripts\deploy-latest.ps1 -BuildRoot "$env:TEMP\sottovoce-builds" -SkipBuild
 ```
+
+The local package is created with `packaging\package.ps1`; it includes runtime
+DLLs, license texts, and notices, plus FFmpeg when available. Temporary
+deployment tests must always supply a temporary `-BuildRoot`.
 
 The Cargo release build always uses `--locked` and writes to that dedicated
 target directory rather than the repository's default `target` directory.
@@ -85,8 +98,9 @@ For a local package, build the frontend and Tauri app, build FFmpeg with
 ```powershell
 bun install --cwd app/ui
 bun run --cwd app/ui build
-pwsh -File scripts/cargo.ps1 -Role builder build --release --locked -p sottovoce
+$target = Join-Path $env:TEMP 'sottovoce-builder-target'
+pwsh -File scripts/cargo.ps1 -Role builder build --release --locked -p sottovoce --target-dir $target
 pwsh -File packaging/build-ffmpeg.ps1
-pwsh -File packaging/package.ps1 -ReleaseDirectory target/release `
+pwsh -File packaging/package.ps1 -ReleaseDirectory (Join-Path $target 'release') `
   -FfmpegPath packaging/dist/ffmpeg.exe
 ```

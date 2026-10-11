@@ -1,15 +1,17 @@
-# Sottovoce
+<h1><img src="docs/images/sottovoce-icon.png" alt="" width="32" height="32"> Sottovoce</h1>
 
 Sottovoce is a Windows call recorder with a Tauri 2 desktop app. It records
 your microphone and computer audio into separate Ogg Opus tracks. On demand,
 it can identify speakers locally with NVIDIA Nemotron diarization and send the
 recording to ElevenLabs for batch, speaker-attributed transcription.
 
+![Sottovoce recording screen with microphone and system audio controls](docs/images/sottovoce-recording.png)
+
 Download the portable ZIP from the
 [GitHub Releases](https://github.com/colthreepv/sottovoce/releases), extract it,
 and run `sottovoce.exe`. WebView2 is required (normally already installed on
-Windows 10 and 11). FFmpeg must currently be available on `PATH`, including
-the `libopus` encoder. Transcription requires an ElevenLabs API key.
+Windows 10 and 11). The portable release includes a minimal FFmpeg beside the
+app. Transcription requires an ElevenLabs API key.
 
 ## Audio device selection
 
@@ -21,12 +23,9 @@ is started manually unless automatic transcription is enabled in Settings.
 ## Data and configuration
 
 Configuration lives at `%APPDATA%\Sottovoce\config.toml`. Existing settings
-are copied from `%APPDATA%\MeetingRecorder\config.toml` on first startup when
-the new file is absent; the old file is kept. Set `SOTTOVOCE_CONFIG_DIR` to
-override the config folder (`MEETING_RECORDER_CONFIG_DIR` remains a fallback
-alias). Meetings default to `Documents\Meetings`. Models, caches and logs live
-under `%LOCALAPPDATA%\Sottovoce`; the Nemotron model may be downloaded again
-after this directory rename.
+are stored there. Set `SOTTOVOCE_CONFIG_DIR` to override the config folder.
+Meetings default to `Documents\Meetings`. Models and caches live under
+`%LOCALAPPDATA%\Sottovoce` in separate subfolders from deploy-only builds.
 
 For development builds and deployment details, see
 [docs/development.md](docs/development.md).

@@ -18,11 +18,11 @@
 .PARAMETER SkipSelftest
     Skip the audio selftest (useful on a machine with no capture devices).
 .PARAMETER SkipGui
-    Compatibility flag; the removed egui UI has no GUI smoke test.
+    Skip GUI checks; this harness tests the development CLI only.
 .PARAMETER KeepWork
     Keep the temporary work folder (meeting fixtures, temp APPDATA).
 .PARAMETER WorkRoot
-    Where screenshots and temporary state are written. Default %TEMP%\mr-qa.
+    Where temporary state is written. Default %TEMP%\sottovoce-qa.
 .EXAMPLE
     pwsh -File scripts/qa/run-e2e.ps1
 #>
@@ -32,7 +32,7 @@ param(
     [switch]$SkipSelftest,
     [switch]$SkipGui,
     [switch]$KeepWork,
-    [string]$WorkRoot = (Join-Path $env:TEMP 'mr-qa')
+    [string]$WorkRoot = (Join-Path $env:TEMP 'sottovoce-qa')
 )
 
 $ErrorActionPreference = 'Stop'
