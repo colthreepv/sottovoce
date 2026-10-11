@@ -1,9 +1,11 @@
-# Sottovoce
+<h1><img src="docs/images/sottovoce-icon.png" alt="" width="32" height="32"> Sottovoce</h1>
 
 Sottovoce is a Windows call recorder with a Tauri 2 desktop app. It records
 your microphone and computer audio into separate Ogg Opus tracks. On demand,
 it can identify speakers locally with NVIDIA Nemotron diarization and send the
 recording to ElevenLabs for batch, speaker-attributed transcription.
+
+![Sottovoce recording screen with microphone and system audio controls](docs/images/sottovoce-recording.png)
 
 Download the portable ZIP from the
 [GitHub Releases](https://github.com/colthreepv/sottovoce/releases), extract it,
